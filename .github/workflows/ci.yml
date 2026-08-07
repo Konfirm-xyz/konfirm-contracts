@@ -24,6 +24,13 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes its findings as a GitHub Check Run,
+    # which needs an explicit grant — the default GITHUB_TOKEN permissions
+    # don't include it, and the scan itself was actually succeeding
+    # (0 vulnerabilities) while this step failed only on the report step.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
