@@ -16,8 +16,11 @@ jobs:
 
       # Real unit tests via soroban-sdk's testutils — no mocked ledger, an
       # in-process simulated one exercising the actual contract logic.
+      # testutils is an opt-in feature (see each contract's Cargo.toml) —
+      # without it, Address::generate/Env::register don't exist and this
+      # fails to even compile.
       - name: Run contract tests
-        run: cargo test --all
+        run: cargo test --all --features testutils
 
   audit:
     runs-on: ubuntu-latest
