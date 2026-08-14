@@ -1,6 +1,6 @@
 # konfirm-contracts
 
-Four Soroban smart contracts backing [Konfirm](https://github.com/samuel2926i39-art/konfirm-backend), a non-custodial payment processor on Stellar. All four are deployed to Testnet (addresses below); none are currently called by the live checkout or cash-out flow in `konfirm-backend` — today's pilot moves value with plain Stellar classic payments, and these contracts are the on-chain layer that path is built toward.
+Four Soroban smart contracts backing [Konfirm](https://github.com/konfirm-HQ/konfirm-backend), a non-custodial payment processor on Stellar. All four are deployed to Testnet (addresses below); none are currently called by the live checkout or cash-out flow in `konfirm-backend` — today's pilot moves value with plain Stellar classic payments, and these contracts are the on-chain layer that path is built toward.
 
 ## Contracts
 
@@ -131,4 +131,4 @@ artifacts/      generated deployment output (gitignored — contains only public
 
 ## License
 
-No license file yet — private project, all rights reserved by default.
+[MIT](LICENSE)
