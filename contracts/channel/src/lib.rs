@@ -306,12 +306,24 @@ impl ChannelContract {
 #[cfg(test)]
 mod test {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn setup_token(env: &Env, admin: &Address) -> Address {
         // Stellar Asset Contract test token, provided by soroban-sdk testutils.
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
         sac.address()
+    }
+
+    // claim_payload's exact length: 15-byte domain tag + 8-byte channel_id
+    // + 8-byte nonce + 16-byte cumulative_amount. Bytes::to_alloc_vec()
+    // would be simpler but needs soroban-sdk's `alloc` feature, which isn't
+    // enabled here — copy_into_slice into a fixed buffer needs no new
+    // feature and the length is fixed anyway.
+    fn payload_bytes(payload: &Bytes) -> [u8; 47] {
+        let mut buf = [0u8; 47];
+        payload.copy_into_slice(&mut buf);
+        buf
     }
 
     #[test]
@@ -445,5 +457,173 @@ mod test {
         let bogus_sig = BytesN::from_array(&env, &[0u8; 64]);
         let res = client.try_checkpoint(&id, &100_0000i128, &1u64, &bogus_sig);
         assert_eq!(res, Err(Ok(ChannelError::Held)));
+    }
+
+    // Every prior checkpoint test used a placeholder pubkey and a bogus
+    // signature, short-circuiting on a stale-nonce or held-channel check
+    // before ed25519_verify ever ran — meaning the contract's actual core
+    // mechanism (accepting a genuine payer-signed claim and paying it out)
+    // had zero coverage. This is the first test to sign for real.
+    #[test]
+    fn checkpoint_accepts_a_real_signed_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &86_400u64);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let payer_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128);
+
+        let cumulative_amount: i128 = 100_0000;
+        let nonce: u64 = 1;
+        // claim_payload is private, called directly rather than
+        // reimplemented — a test that built its own byte layout could pass
+        // for the wrong reason if it silently drifted from what
+        // checkpoint() actually verifies.
+        let payload = ChannelContract::claim_payload(&env, id, nonce, cumulative_amount);
+        let signature = BytesN::from_array(&env, &signing_key.sign(&payload_bytes(&payload)).to_bytes());
+
+        client.checkpoint(&id, &cumulative_amount, &nonce, &signature);
+
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.claimed, cumulative_amount);
+        assert_eq!(ch.nonce, nonce);
+
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&payee), cumulative_amount);
+        assert_eq!(token_client.balance(&contract_id), 500_0000i128 - cumulative_amount);
+    }
+
+    // The dispute mechanism has no dedicated function — it *is* an ordinary
+    // checkpoint() call, just one that happens to land after Closing has
+    // started. No existing test exercised checkpoint() in the Closing
+    // state at all, so this path — the literal reason a challenge period
+    // exists — had zero coverage before this.
+    #[test]
+    fn checkpoint_accepts_higher_nonce_claim_during_closing() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &3_600u64);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let payer_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128);
+
+        let sign_claim = |nonce: u64, amount: i128| -> BytesN<64> {
+            let payload = ChannelContract::claim_payload(&env, id, nonce, amount);
+            BytesN::from_array(&env, &signing_key.sign(&payload_bytes(&payload)).to_bytes())
+        };
+
+        // An early, small checkpoint — standing in for whatever the last
+        // on-chain-recorded state was before a close attempt started.
+        client.checkpoint(&id, &50_0000i128, &1u64, &sign_claim(1, 50_0000));
+        client.initiate_close(&payer, &id);
+
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.status, ChannelStatus::Closing);
+
+        // The better, higher-nonce claim — submitted during the challenge
+        // window, after Closing has already started. This is the actual
+        // dispute: proving checkpoint() still accepts it here, not just
+        // while Open.
+        client.checkpoint(&id, &300_0000i128, &2u64, &sign_claim(2, 300_0000));
+
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.claimed, 300_0000i128);
+        assert_eq!(ch.nonce, 2u64);
+
+        env.ledger().with_mut(|l| l.timestamp += 3_601);
+        client.finalize_close(&id);
+
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&payee), 300_0000i128);
+        // Remainder is 500 - 300, not 500 - 50 — proves finalize_close
+        // respects the dispute's outcome, not the pre-dispute state.
+        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 300_0000i128);
+        assert_eq!(token_client.balance(&contract_id), 0i128);
+    }
+
+    #[test]
+    fn checkpoint_rejects_amount_exceeding_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &86_400u64);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let payer_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128);
+
+        // A validly-signed claim for more than was ever deposited — must be
+        // rejected on the deposit check, not accepted just because the
+        // signature is genuine.
+        let cumulative_amount: i128 = 600_0000;
+        let nonce: u64 = 1;
+        let payload = ChannelContract::claim_payload(&env, id, nonce, cumulative_amount);
+        let signature = BytesN::from_array(&env, &signing_key.sign(&payload_bytes(&payload)).to_bytes());
+
+        let res = client.try_checkpoint(&id, &cumulative_amount, &nonce, &signature);
+        assert_eq!(res, Err(Ok(ChannelError::ExceedsDeposit)));
+    }
+
+    #[test]
+    fn top_up_increases_deposited_capacity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &86_400u64);
+        let payer_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128);
+
+        client.top_up(&payer, &id, &200_0000i128);
+
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.deposited, 700_0000i128);
+
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&contract_id), 700_0000i128);
+        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 700_0000i128);
     }
 }

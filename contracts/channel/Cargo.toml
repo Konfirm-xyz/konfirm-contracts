@@ -12,5 +12,15 @@ doctest = false
 [dependencies]
 soroban-sdk = "27.0.5"
 
+[dev-dependencies]
+# Already present transitively (soroban-sdk's own testutils::sign module
+# depends on it) — declared directly here, pinned to the exact version
+# already resolved in Cargo.lock, so tests can sign raw claim_payload bytes
+# directly rather than going through soroban-sdk's Sign<M> trait (which
+# XDR-encodes an ScVal first — not what checkpoint()'s ed25519_verify
+# checks against; claim_payload builds a raw Bytes buffer, no ScVal
+# involved, so the test must sign those exact raw bytes to match).
+ed25519-dalek = "2.2.0"
+
 [features]
 testutils = ["soroban-sdk/testutils"]
