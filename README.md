@@ -81,7 +81,7 @@ Treasury signers (2-of-3 threshold): `GAEMG5TVLEIQYCY3XB4EJT742DIE3FQO53RSESSYJQ
 
 - Rust, `soroban-sdk 27.0.5`
 - `#![no_std]` contracts — no heap allocation, no std library
-- 21 unit tests across the four contracts using `soroban-sdk`'s `testutils`
+- 27 unit tests across the four contracts using `soroban-sdk`'s `testutils`
 
 ## Prerequisites
 
@@ -96,21 +96,31 @@ Treasury signers (2-of-3 threshold): `GAEMG5TVLEIQYCY3XB4EJT742DIE3FQO53RSESSYJQ
 ## Build & test
 
 ```bash
-cargo test
+cargo test --all --features testutils
 ```
+
+The `testutils` feature must be enabled. Plain `cargo test` fails to compile, because the test code imports `soroban_sdk::testutils`. CI runs the command above.
 
 ```bash
 stellar contract build --target wasm32v1-none
 ```
 
-Deploy a single contract (repeat per contract, `channel` shown, note the extra constructor arg):
+Deploy, then initialize. These contracts have **no constructor**: passing `-- --admin ...` at deploy time does not set them up. The `initialize` call is separate. The `channel` example:
 
 ```bash
 stellar contract deploy \
-  --wasm target/wasm32v1-none/release/channel.wasm \
+  --wasm target/wasm32v1-none/release/konfirm_channel.wasm \
+  --source deployer --network testnet
+# -> prints the contract id, <CONTRACT_ID>
+
+stellar contract invoke --id <CONTRACT_ID> \
   --source deployer --network testnet \
-  -- --admin <admin_address> --challenge_period_secs 86400
+  -- initialize --admin <admin_address> --challenge_period_secs 86400
 ```
+
+Each contract's `initialize` takes its own arguments: `compliance` and `payment` take `--admin`; `treasury` takes `--admin --token --signers --threshold`; `channel` takes `--admin --challenge_period_secs`. Calling it twice fails with `AlreadyInitialized`, which is the protection.
+
+Verified on testnet: a deploy without `initialize` leaves every admin call failing with `NotInitialized` (error 2).
 
 ## Project structure
 
