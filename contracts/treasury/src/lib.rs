@@ -154,7 +154,8 @@ impl TreasuryContract {
         Ok(())
     }
 
-    pub fn execute_settlement(env: Env, settlement_id: u64) -> Result<(), TreasuryError> {
+    pub fn execute_settlement(env: Env, caller: Address, settlement_id: u64) -> Result<(), TreasuryError> {
+        Self::require_signer(&env, &caller)?;
         Self::require_not_paused(&env)?;
         let threshold: u32 = env
             .storage()
@@ -250,9 +251,10 @@ mod test {
         env.mock_all_auths();
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
+        let signer0 = signers.get(0).unwrap();
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
-        let res = client.try_execute_settlement(&id);
+        let id = client.propose_settlement(&signer0, &merchant, &1_000_0000i128);
+        let res = client.try_execute_settlement(&signer0, &id);
         assert_eq!(res, Err(Ok(TreasuryError::ThresholdNotMet)));
     }
 
@@ -262,10 +264,11 @@ mod test {
         env.mock_all_auths();
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
+        let signer0 = signers.get(0).unwrap();
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signer0, &merchant, &1_000_0000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
-        client.execute_settlement(&id);
+        client.execute_settlement(&signer0, &id);
         let settlement = client.get_settlement(&id);
         assert_eq!(settlement.status, SettlementStatus::Executed);
     }
@@ -280,6 +283,20 @@ mod test {
 
         let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
         let res = client.try_approve_settlement(&outsider, &id);
+        assert_eq!(res, Err(Ok(TreasuryError::NotSigner)));
+    }
+
+    #[test]
+    fn non_signer_cannot_execute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, _token) = setup(&env);
+        let merchant = Address::generate(&env);
+        let outsider = Address::generate(&env);
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        client.approve_settlement(&signers.get(1).unwrap(), &id);
+        let res = client.try_execute_settlement(&outsider, &id);
         assert_eq!(res, Err(Ok(TreasuryError::NotSigner)));
     }
 
@@ -301,11 +318,12 @@ mod test {
         env.mock_all_auths();
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
+        let signer0 = signers.get(0).unwrap();
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signer0, &merchant, &1_000_0000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
-        client.execute_settlement(&id);
-        let res = client.try_execute_settlement(&id);
+        client.execute_settlement(&signer0, &id);
+        let res = client.try_execute_settlement(&signer0, &id);
         assert_eq!(res, Err(Ok(TreasuryError::NotPending)));
     }
 
@@ -329,14 +347,15 @@ mod test {
         let (client, _admin, signers, token_id) = setup(&env);
         let merchant = Address::generate(&env);
         let token_client = token::TokenClient::new(&env, &token_id);
+        let signer0 = signers.get(0).unwrap();
 
         let contract_balance_before = token_client.balance(&client.address);
         let merchant_balance_before = token_client.balance(&merchant);
         assert_eq!(merchant_balance_before, 0);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signer0, &merchant, &1_000_0000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
-        client.execute_settlement(&id);
+        client.execute_settlement(&signer0, &id);
 
         // The actual gap this whole fix closes: before it, execute_settlement
         // only flipped a status flag and neither balance below would have
@@ -367,10 +386,11 @@ mod test {
         // an underfunded treasury can't silently mark a settlement
         // Executed without the money actually moving.
         let merchant = Address::generate(&env);
+        let signer0 = signers.get(0).unwrap();
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signer0, &merchant, &1_000_0000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
-        let res = client.try_execute_settlement(&id);
+        let res = client.try_execute_settlement(&signer0, &id);
         assert!(res.is_err(), "an underfunded transfer should trap, not silently succeed");
 
         let settlement = client.get_settlement(&id);
