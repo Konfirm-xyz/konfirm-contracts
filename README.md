@@ -41,7 +41,7 @@ Default-allow: an address is permitted unless explicitly blocked. `clear_address
 | `initialize` | signer set + threshold |
 | `propose_settlement` | creates a pending settlement |
 | `approve_settlement` | `(signer: Address, settlement_id: u64)` — rejects non-signers and double-approval |
-| `execute_settlement` | `(settlement_id: u64)` — only once threshold is met; rejects double-execution |
+| `execute_settlement` | `(caller: Address, settlement_id: u64)` — only once threshold is met; rejects non-signers and double-execution |
 | `get_settlement` | `(settlement_id: u64) -> Settlement` |
 | `pause` / `unpause` | `()` |
 
