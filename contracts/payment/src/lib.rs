@@ -27,6 +27,7 @@ enum DataKey {
     Paused,
     NextId,
     Payment(u64),
+    ByTxHash(BytesN<32>),
 }
 
 #[contracterror]
@@ -40,6 +41,7 @@ pub enum PaymentError {
     NotFound = 5,
     ZeroAmount = 6,
     AlreadyRefunded = 7,
+    DuplicateTxHash = 8,
 }
 
 #[contract]
@@ -89,6 +91,10 @@ impl PaymentContract {
         if amount <= 0 {
             return Err(PaymentError::ZeroAmount);
         }
+        let tx_key = DataKey::ByTxHash(tx_hash.clone());
+        if env.storage().persistent().has(&tx_key) {
+            return Err(PaymentError::DuplicateTxHash);
+        }
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -102,6 +108,7 @@ impl PaymentContract {
             refunded: false,
         };
         env.storage().persistent().set(&DataKey::Payment(id), &record);
+        env.storage().persistent().set(&tx_key, &id);
         env.events().publish((symbol_short!("recorded"), merchant), (id, link_id, amount));
         Ok(id)
     }
@@ -222,5 +229,21 @@ mod test {
         client.pause();
         let res = client.try_record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
         assert_eq!(res, Err(Ok(PaymentError::Paused)));
+    }
+
+    #[test]
+    fn duplicate_tx_hash_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        let id = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        assert_eq!(id, 1u64);
+
+        let dup = client.try_record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        assert_eq!(dup, Err(Ok(PaymentError::DuplicateTxHash)));
     }
 }
