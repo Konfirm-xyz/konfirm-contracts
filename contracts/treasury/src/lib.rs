@@ -13,9 +13,14 @@ pub enum SettlementStatus {
 #[contracttype]
 #[derive(Clone)]
 pub struct Settlement {
+    /// The merchant address that will receive the payout.
     pub merchant: Address,
+    /// The amount to be transferred in the smallest unit of the token.
     pub amount: i128,
+    /// The signers who have approved this settlement. The proposer is
+    /// automatically included as the first entry in this vector.
     pub approvals: Vec<Address>,
+    /// The current lifecycle status of this settlement.
     pub status: SettlementStatus,
 }
 
