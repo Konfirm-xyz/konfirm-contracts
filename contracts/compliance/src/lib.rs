@@ -30,6 +30,8 @@ pub struct ComplianceContract;
 // requiring every legitimate address to be pre-enrolled.
 #[contractimpl]
 impl ComplianceContract {
+    /// One-time setup: stores `admin` and starts unpaused. `admin` must authorize
+    /// the call. Returns `AlreadyInitialized` if an admin is already set.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ComplianceError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(ComplianceError::AlreadyInitialized);
@@ -41,6 +43,8 @@ impl ComplianceContract {
         Ok(())
     }
 
+    /// Loads the stored admin and requires its authorization. Returns
+    /// `NotInitialized` if `initialize` has not been called.
     fn require_admin(env: &Env) -> Result<Address, ComplianceError> {
         let admin: Address = env
             .storage()
@@ -51,6 +55,7 @@ impl ComplianceContract {
         Ok(admin)
     }
 
+    /// Returns `Paused` while the contract is paused; otherwise `Ok(())`.
     fn require_not_paused(env: &Env) -> Result<(), ComplianceError> {
         let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
         if paused {
@@ -66,6 +71,10 @@ impl ComplianceContract {
         !env.storage().persistent().has(&DataKey::Blocked(addr))
     }
 
+    /// Admin-only; fails with `Paused` while paused. Marks `addr` as blocked, so
+    /// `is_allowed` returns `false` for it. Also writes `Allowed(addr) = false`
+    /// as an explicit "not allowed" record, the counterpart of the `true` record
+    /// `allow_address` writes; `is_allowed` only looks at the blocked marker.
     pub fn block_address(env: Env, addr: Address) -> Result<(), ComplianceError> {
         Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
@@ -86,6 +95,10 @@ impl ComplianceContract {
         Ok(())
     }
 
+    /// Admin-only; fails with `Paused` while paused. Removes both the blocked and
+    /// allowed records for `addr`, returning it to the default-allow state as if
+    /// it had never been flagged (unlike `allow_address`, which leaves an
+    /// explicit allowed record).
     pub fn clear_address(env: Env, addr: Address) -> Result<(), ComplianceError> {
         Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
@@ -95,12 +108,16 @@ impl ComplianceContract {
         Ok(())
     }
 
+    /// Admin-only. Pauses the contract: `block_address`, `allow_address` and
+    /// `clear_address` fail with `Paused`. `is_allowed` keeps working.
     pub fn pause(env: Env) -> Result<(), ComplianceError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         Ok(())
     }
 
+    /// Admin-only. Resumes the contract after `pause`, re-enabling
+    /// `block_address`, `allow_address` and `clear_address`.
     pub fn unpause(env: Env) -> Result<(), ComplianceError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
