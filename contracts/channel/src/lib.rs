@@ -29,14 +29,28 @@ pub enum ChannelStatus {
 #[contracttype]
 #[derive(Clone)]
 pub struct Channel {
+    /// The address that funds the escrow and signs off-chain claims.
     pub payer: Address,
+    /// The address that receives the claimed funds.
     pub payee: Address,
+    /// The Stellar Asset Contract (SAC) token address this channel escrows.
     pub token: Address,
+    /// The Ed25519 public key of the payer, used to verify off-chain claim
+    /// signatures.
     pub payer_pubkey: BytesN<32>,
+    /// Total amount ever escrowed. (The delta between `deposited` and
+    /// `claimed` determines the remainder payout during `finalize_close`).
     pub deposited: i128,
+    /// Cumulative amount paid to the payee so far.
     pub claimed: i128,
+    /// Monotonically-increasing counter that prevents replay attacks and
+    /// ensures off-chain signed claims are processed in order.
     pub nonce: u64,
+    /// The current lifecycle state of the channel.
     pub status: ChannelStatus,
+    /// Ledger wall-clock seconds (`env.ledger().timestamp()`), not a ledger
+    /// sequence number. Set only by the payer/payee via `initiate_close`,
+    /// never the admin.
     pub closing_at: u64,
 }
 

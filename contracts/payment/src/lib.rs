@@ -12,11 +12,17 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_sh
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaymentRecord {
+    /// The merchant (payee) address receiving the payment.
     pub merchant: Address,
+    /// The customer (payer) address that sent the funds.
     pub payer: Address,
+    /// The payment-link ID this record is associated with.
     pub link_id: u64,
+    /// The amount of the payment in the smallest unit of the asset.
     pub amount: i128,
+    /// The cryptographic hash of the transaction on the Stellar network.
     pub tx_hash: BytesN<32>,
+    /// Whether this payment has been refunded.
     pub refunded: bool,
 }
 
