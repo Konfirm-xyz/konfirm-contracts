@@ -181,4 +181,16 @@ mod test {
         let res = client.try_initialize(&admin);
         assert_eq!(res, Err(Ok(ComplianceError::AlreadyInitialized)));
     }
+
+    #[test]
+    fn test_clear_address_removes_flags() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let target = Address::generate(&env);
+
+        client.block_address(&target);
+        client.clear_address(&target);
+        assert!(client.is_allowed(&target));
+    }
 }
