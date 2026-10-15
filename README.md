@@ -102,7 +102,7 @@ cargo test --all --features testutils
 The `testutils` feature must be enabled. Plain `cargo test` fails to compile, because the test code imports `soroban_sdk::testutils`. CI runs the command above.
 
 ```bash
-stellar contract build --target wasm32v1-none
+stellar contract build
 ```
 
 Deploy, then initialize. These contracts have **no constructor**: passing `-- --admin ...` at deploy time does not set them up. The `initialize` call is separate. The `channel` example:
