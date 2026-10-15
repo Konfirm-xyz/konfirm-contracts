@@ -46,6 +46,7 @@ pub enum TreasuryError {
     ThresholdNotMet = 9,
     NotPending = 10,
     InvalidThreshold = 11,
+    TooManySigners = 12,
 }
 
 #[contract]
@@ -62,6 +63,11 @@ impl TreasuryContract {
     ) -> Result<(), TreasuryError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(TreasuryError::AlreadyInitialized);
+        }
+        // Limit of 20 is a sane upper bound to prevent misconfigurations,
+        // though network transaction size limits naturally cap it at ~3,300.
+        if signers.len() > 20 {
+            return Err(TreasuryError::TooManySigners);
         }
         if threshold == 0 || threshold > signers.len() {
             return Err(TreasuryError::InvalidThreshold);
