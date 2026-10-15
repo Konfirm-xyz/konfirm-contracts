@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env};
 
@@ -165,11 +165,11 @@ mod test {
         let payer = Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[7u8; 32]);
 
-        let id = client.record_payment(&merchant, &payer, &42u64, &1_000_0000i128, &tx_hash);
+        let id = client.record_payment(&merchant, &payer, &42u64, &10_000_000i128, &tx_hash);
         let rec = client.get_payment(&id);
         assert_eq!(rec.merchant, merchant);
         assert_eq!(rec.link_id, 42u64);
-        assert_eq!(rec.amount, 1_000_0000i128);
+        assert_eq!(rec.amount, 10_000_000i128);
         assert!(!rec.refunded);
     }
 

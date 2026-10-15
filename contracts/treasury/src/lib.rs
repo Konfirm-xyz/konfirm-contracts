@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env, Vec};
 
@@ -251,7 +251,7 @@ mod test {
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         let res = client.try_execute_settlement(&id);
         assert_eq!(res, Err(Ok(TreasuryError::ThresholdNotMet)));
     }
@@ -263,7 +263,7 @@ mod test {
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
         client.execute_settlement(&id);
         let settlement = client.get_settlement(&id);
@@ -278,7 +278,7 @@ mod test {
         let merchant = Address::generate(&env);
         let outsider = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         let res = client.try_approve_settlement(&outsider, &id);
         assert_eq!(res, Err(Ok(TreasuryError::NotSigner)));
     }
@@ -290,7 +290,7 @@ mod test {
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         let res = client.try_approve_settlement(&signers.get(0).unwrap(), &id);
         assert_eq!(res, Err(Ok(TreasuryError::AlreadyApproved)));
     }
@@ -302,7 +302,7 @@ mod test {
         let (client, _admin, signers, _token) = setup(&env);
         let merchant = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
         client.execute_settlement(&id);
         let res = client.try_execute_settlement(&id);
@@ -334,15 +334,15 @@ mod test {
         let merchant_balance_before = token_client.balance(&merchant);
         assert_eq!(merchant_balance_before, 0);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
         client.execute_settlement(&id);
 
         // The actual gap this whole fix closes: before it, execute_settlement
         // only flipped a status flag and neither balance below would have
         // moved at all.
-        assert_eq!(token_client.balance(&merchant), 1_000_0000i128);
-        assert_eq!(token_client.balance(&client.address), contract_balance_before - 1_000_0000i128);
+        assert_eq!(token_client.balance(&merchant), 10_000_000i128);
+        assert_eq!(token_client.balance(&client.address), contract_balance_before - 10_000_000i128);
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod test {
         // Executed without the money actually moving.
         let merchant = Address::generate(&env);
 
-        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &10_000_000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
         let res = client.try_execute_settlement(&id);
         assert!(res.is_err(), "an underfunded transfer should trap, not silently succeed");
