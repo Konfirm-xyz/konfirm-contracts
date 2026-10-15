@@ -161,6 +161,7 @@ impl ChannelContract {
         Ok(id)
     }
 
+    /// Note: This function is intentionally unused by the current pilot application. It is maintained as part of the contract interface and will be wired up when advanced dispute management and balance reloading features are prioritized.
     pub fn top_up(env: Env, payer: Address, channel_id: u64, amount: i128) -> Result<(), ChannelError> {
         payer.require_auth();
         Self::require_not_paused(&env)?;
@@ -265,6 +266,7 @@ impl ChannelContract {
         Ok(())
     }
 
+    /// Note: This function is intentionally unused by the current pilot application. It is maintained as part of the contract interface and will be wired up when advanced dispute management and balance reloading features are prioritized.
     pub fn hold_channel(env: Env, channel_id: u64) -> Result<(), ChannelError> {
         Self::require_admin(&env)?;
         let mut ch = Self::get_channel(&env, channel_id)?;
@@ -274,6 +276,7 @@ impl ChannelContract {
         Ok(())
     }
 
+    /// Note: This function is intentionally unused by the current pilot application. It is maintained as part of the contract interface and will be wired up when advanced dispute management and balance reloading features are prioritized.
     pub fn release_hold(env: Env, channel_id: u64) -> Result<(), ChannelError> {
         Self::require_admin(&env)?;
         let mut ch = Self::get_channel(&env, channel_id)?;
