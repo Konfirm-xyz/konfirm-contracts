@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
@@ -337,7 +337,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -368,7 +368,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -392,7 +392,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -405,7 +405,7 @@ mod test {
         client.finalize_close(&id);
 
         let token_client = token::TokenClient::new(&env, &token_id);
-        assert_eq!(token_client.balance(&payer), 1_000_0000i128);
+        assert_eq!(token_client.balance(&payer), 10_000_000i128);
         assert_eq!(token_client.balance(&contract_id), 0i128);
     }
 
@@ -421,7 +421,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token::StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_0000i128);
+        token::StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -445,7 +445,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token::StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000_0000i128);
+        token::StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -475,7 +475,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -521,7 +521,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -561,7 +561,7 @@ mod test {
         assert_eq!(token_client.balance(&payee), 300_0000i128);
         // Remainder is 500 - 300, not 500 - 50 — proves finalize_close
         // respects the dispute's outcome, not the pre-dispute state.
-        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 300_0000i128);
+        assert_eq!(token_client.balance(&payer), 10_000_000i128 - 300_0000i128);
         assert_eq!(token_client.balance(&contract_id), 0i128);
     }
 
@@ -576,7 +576,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -609,7 +609,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        token_admin_client.mint(&payer, &1_000_0000i128);
+        token_admin_client.mint(&payer, &10_000_000i128);
 
         let contract_id = env.register(ChannelContract, ());
         let client = ChannelContractClient::new(&env, &contract_id);
@@ -624,6 +624,6 @@ mod test {
 
         let token_client = token::TokenClient::new(&env, &token_id);
         assert_eq!(token_client.balance(&contract_id), 700_0000i128);
-        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 700_0000i128);
+        assert_eq!(token_client.balance(&payer), 10_000_000i128 - 700_0000i128);
     }
 }
