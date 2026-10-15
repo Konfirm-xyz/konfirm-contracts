@@ -371,7 +371,10 @@ mod test {
         let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
         client.approve_settlement(&signers.get(1).unwrap(), &id);
         let res = client.try_execute_settlement(&id);
-        assert!(res.is_err(), "an underfunded transfer should trap, not silently succeed");
+        assert!(
+        matches!(res, Err(Err(_))), 
+        "expected a host-level trap, not a typed contract error"
+        );
 
         let settlement = client.get_settlement(&id);
         assert_eq!(settlement.status, SettlementStatus::Pending, "a reverted execute must leave the settlement Pending, not Executed");
