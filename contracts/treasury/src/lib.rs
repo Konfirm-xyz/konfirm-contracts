@@ -53,6 +53,10 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
+    /// One-time contract initializer. Requires authentication of the `admin` address.
+    /// Not pause-sensitive (pausing is irrelevant pre-initialization).
+    /// Sets the multisig signer set and the approval threshold required for settlement
+    /// execution. Rejects a threshold of zero or greater than the number of signers.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -76,6 +80,8 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Returns [`TreasuryError::Paused`] if the contract is currently paused,
+    /// otherwise proceeds.
     fn require_not_paused(env: &Env) -> Result<(), TreasuryError> {
         let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
         if paused {
@@ -84,6 +90,8 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Verifies that `who` is both authenticated (via `require_auth`) and a
+    /// registered multisig signer. Returns [`TreasuryError::NotSigner`] otherwise.
     fn require_signer(env: &Env, who: &Address) -> Result<(), TreasuryError> {
         who.require_auth();
         let signers: Vec<Address> = env
@@ -97,6 +105,8 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Verifies that the caller is authenticated as the contract `admin`.
+    /// Returns [`TreasuryError::Unauthorized`] if authentication fails.
     fn require_admin(env: &Env) -> Result<(), TreasuryError> {
         let admin: Address = env
             .storage()
@@ -107,6 +117,12 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Proposes a new settlement to a `merchant` for the given `amount`.
+    /// Requires authentication of a registered multisig `proposer` (signer).
+    /// Pause-sensitive — reverts when the contract is paused.
+    /// The proposer is automatically recorded as the first approval. The settlement
+    /// remains Pending until enough distinct signers have approved to meet the
+    /// configured threshold.
     pub fn propose_settlement(
         env: Env,
         proposer: Address,
@@ -133,6 +149,11 @@ impl TreasuryContract {
         Ok(id)
     }
 
+    /// Approves a pending settlement identified by `settlement_id`.
+    /// Requires authentication of a registered multisig `signer`.
+    /// Pause-sensitive — reverts when the contract is paused.
+    /// Each signer may approve at most once. Execution becomes possible once the
+    /// number of unique approvals meets or exceeds the configured threshold.
     pub fn approve_settlement(env: Env, signer: Address, settlement_id: u64) -> Result<(), TreasuryError> {
         Self::require_signer(&env, &signer)?;
         Self::require_not_paused(&env)?;
@@ -154,6 +175,14 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Executes a previously-approved settlement by transferring the settlement
+    /// amount from the treasury to the merchant's address.
+    /// No direct caller authentication — authorization is provided by the prior
+    /// signature-gathering in [`approve_settlement`].
+    /// Pause-sensitive — reverts when the contract is paused.
+    /// Requires `approvals.len() >= threshold`; if not met the call returns
+    /// [`TreasuryError::ThresholdNotMet`]. On transfer failure (e.g. insufficient
+    /// balance) the entire call reverts and the settlement remains Pending.
     pub fn execute_settlement(env: Env, settlement_id: u64) -> Result<(), TreasuryError> {
         Self::require_not_paused(&env)?;
         let threshold: u32 = env
@@ -195,6 +224,8 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Returns the [`Settlement`] data for the given `settlement_id`.
+    /// No authentication required. Not pause-sensitive (read-only query).
     pub fn get_settlement(env: Env, settlement_id: u64) -> Result<Settlement, TreasuryError> {
         env.storage()
             .persistent()
@@ -202,12 +233,18 @@ impl TreasuryContract {
             .ok_or(TreasuryError::NotFound)
     }
 
+    /// Pauses the contract, blocking settlement proposals, approvals, and executions.
+    /// Requires authentication of the contract `admin`.
+    /// Pause-sensitive — this function changes the paused state itself.
     pub fn pause(env: Env) -> Result<(), TreasuryError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         Ok(())
     }
 
+    /// Unpauses the contract, re-enabling settlement operations.
+    /// Requires authentication of the contract `admin`.
+    /// Pause-sensitive — this function changes the paused state itself.
     pub fn unpause(env: Env) -> Result<(), TreasuryError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
