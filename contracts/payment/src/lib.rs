@@ -95,14 +95,14 @@ impl PaymentContract {
 
         let record = PaymentRecord {
             merchant: merchant.clone(),
-            payer,
+            payer: payer.clone(),
             link_id,
             amount,
-            tx_hash,
+            tx_hash: tx_hash.clone(),
             refunded: false,
         };
         env.storage().persistent().set(&DataKey::Payment(id), &record);
-        env.events().publish((symbol_short!("recorded"), merchant), (id, link_id, amount));
+        env.events().publish((symbol_short!("recorded"), merchant, payer), (id, link_id, amount, tx_hash));
         Ok(id)
     }
 
@@ -170,7 +170,13 @@ mod test {
         assert_eq!(rec.merchant, merchant);
         assert_eq!(rec.link_id, 42u64);
         assert_eq!(rec.amount, 1_000_0000i128);
+        assert_eq!(rec.tx_hash, tx_hash);
         assert!(!rec.refunded);
+
+        let recorded_events = env.events().all().last().unwrap();
+        let (topics, data) = recorded_events;
+        assert_eq!(topics, (symbol_short!("recorded"), merchant, payer));
+        assert_eq!(data, (id, 42u64, 1_000_0000i128, tx_hash));
     }
 
     #[test]
