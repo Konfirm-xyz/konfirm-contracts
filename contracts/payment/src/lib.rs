@@ -377,4 +377,22 @@ mod test {
         assert!(res.is_err());
         assert_eq!(client.try_get_payment(&1u64), Err(Ok(PaymentError::NotFound)));
     }
+
+    #[test]
+    fn duplicate_tx_hash_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[42u8; 32]);
+
+        // First recording succeeds
+        let id = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        assert_eq!(id, 1u64);
+
+        // Second recording with identical tx_hash fails with DuplicateTxHash while unpaused
+        let res = client.try_record_payment(&merchant, &payer, &2u64, &200_0000i128, &tx_hash);
+        assert_eq!(res, Err(Ok(PaymentError::DuplicateTxHash)));
+    }
 }
