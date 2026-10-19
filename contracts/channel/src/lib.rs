@@ -347,6 +347,9 @@ impl ChannelContract {
             return Err(ChannelError::NotOpen);
         }
         env.storage().persistent().set(&DataKey::HeldFrom(channel_id), &ch.status);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::HeldFrom(channel_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         ch.status = ChannelStatus::Held;
         Self::save_channel(&env, channel_id, &ch);
         env.events().publish((symbol_short!("held"),), channel_id);
