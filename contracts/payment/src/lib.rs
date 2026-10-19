@@ -177,6 +177,7 @@ impl PaymentContract {
     /// `is_voided` before trusting it. Fails with `NotFound`, `AlreadyVoided`,
     /// `AlreadyRefunded`, or `Paused` while paused.
     pub fn void_payment(env: Env, payment_id: u64) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
         let record: PaymentRecord = env
@@ -191,6 +192,9 @@ impl PaymentContract {
             return Err(PaymentError::AlreadyRefunded);
         }
         env.storage().persistent().set(&DataKey::Voided(payment_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Voided(payment_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.events().publish((symbol_short!("voided"),), payment_id);
         Ok(())
     }
@@ -376,5 +380,27 @@ mod test {
         let res = client.try_record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
         assert!(res.is_err());
         assert_eq!(client.try_get_payment(&1u64), Err(Ok(PaymentError::NotFound)));
+    }
+
+    #[test]
+    fn void_payment_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[5u8; 32]);
+
+        let id = client.record_payment(&merchant, &payer, &1u64, &500_0000i128, &tx_hash);
+        assert!(!client.is_voided(&id));
+
+        client.void_payment(&id);
+        assert!(client.is_voided(&id));
+
+        let res = client.try_void_payment(&id);
+        assert_eq!(res, Err(Ok(PaymentError::AlreadyVoided)));
+
+        let res = client.try_mark_refunded(&id);
+        assert_eq!(res, Err(Ok(PaymentError::Voided)));
     }
 }
