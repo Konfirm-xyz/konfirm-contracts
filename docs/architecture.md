@@ -38,3 +38,7 @@ None of the four contracts is called by the live checkout or cash-out flow yet. 
 - **Deploy and initialize are separate steps.** The contracts have no constructor. A deployed but uninitialized contract rejects admin calls with `NotInitialized`. See the README's deploy section.
 - **The challenge period is a deployment parameter.** `channel` takes `challenge_period_secs` at `initialize` and does not hard-code it. The deployed Testnet instance uses 86400 seconds.
 - **Treasury threshold is fixed at initialization.** The Testnet instance is 2-of-3. Changing it means a new deployment.
+- **`record_payment` keeps five flat parameters on purpose (#47).** Folding `merchant, payer, link_id, amount, tx_hash` into an input struct was considered and declined:
+  - In `konfirm-backend` (`src/payments/payment-attestation.service.ts`), `PaymentAttestationService.attest` calls `client.record_payment({ merchant, payer, link_id, amount, tx_hash })` via `@stellar/stellar-sdk/contract` `Client.from<PaymentContract>()`, which already wraps the contract's 5 flat parameters into a single named-argument object on the TypeScript side (`src/common/stellar-sdk-contract.d.ts`). A contract-level input struct would force a redundant `{ input: { ... } }` wrapper in TypeScript.
+  - Flat scalar args map directly onto `stellar contract invoke -- record_payment --merchant … --tx_hash …`. A struct arg would require hand-written JSON on the CLI.
+  - Keeping the 5 flat parameters preserves the deployed Testnet contract's ABI and existing test snapshots.
