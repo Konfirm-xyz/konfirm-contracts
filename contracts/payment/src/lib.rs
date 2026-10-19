@@ -254,6 +254,7 @@ impl PaymentContract {
 
     /// Admin-only. Lifts a pause set by `pause`. Callable while paused.
     pub fn unpause(env: Env) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events().publish((symbol_short!("unpaused"),), ());
@@ -376,5 +377,28 @@ mod test {
         let res = client.try_record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
         assert!(res.is_err());
         assert_eq!(client.try_get_payment(&1u64), Err(Ok(PaymentError::NotFound)));
+    }
+
+    #[test]
+    fn pause_and_unpause_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[4u8; 32]);
+
+        assert!(!client.is_paused());
+        client.pause();
+        assert!(client.is_paused());
+
+        let res = client.try_record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        assert_eq!(res, Err(Ok(PaymentError::Paused)));
+
+        client.unpause();
+        assert!(!client.is_paused());
+
+        let id = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        assert_eq!(id, 1u64);
     }
 }
