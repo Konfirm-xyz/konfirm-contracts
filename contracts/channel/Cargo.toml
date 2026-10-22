@@ -11,7 +11,7 @@ doctest = false
 
 [dependencies]
 konfirm-common = { path = "../common" }
-soroban-sdk = "27.0.5"
+soroban-sdk = "29.0.1"
 
 [dev-dependencies]
 # Already present transitively (soroban-sdk's own testutils::sign module
