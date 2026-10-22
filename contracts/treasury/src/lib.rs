@@ -271,10 +271,11 @@ impl TreasuryContract {
         if settlement.approvals.contains(&signer) {
             return Err(TreasuryError::AlreadyApproved);
         }
-        settlement.approvals.push_back(signer);
+        settlement.approvals.push_back(signer.clone());
         settlement.approved_at.push_back(env.ledger().timestamp());
-        Self::save_settlement(&env, settlement_id, &settlement);
-        env.events().publish((symbol_short!("approved"),), settlement_id);
+        env.storage().persistent().set(&DataKey::Settlement(settlement_id), &settlement);
+        env.storage().persistent().extend_ttl(&DataKey::Settlement(settlement_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.events().publish((symbol_short!("approved"), signer), settlement_id);
         Ok(())
     }
 
@@ -320,4 +321,89 @@ impl TreasuryContract {
 
     /// Signer-onl
 
-/* … truncated 1642 chars — edit only what you need near the top … */
+    #[test]
+    fn zero_threshold_rejected_at_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let signers = vec![&env, Address::generate(&env)];
+        let contract_id = env.register(TreasuryContract, ());
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        let res = client.try_initialize(&admin, &token, &signers, &0u32);
+        assert_eq!(res, Err(Ok(TreasuryError::InvalidThreshold)));
+    }
+
+    #[test]
+    fn execute_settlement_actually_transfers_the_real_token_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, token_id) = setup(&env);
+        let merchant = Address::generate(&env);
+        let token_client = token::TokenClient::new(&env, &token_id);
+
+        let contract_balance_before = token_client.balance(&client.address);
+        let merchant_balance_before = token_client.balance(&merchant);
+        assert_eq!(merchant_balance_before, 0);
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        client.approve_settlement(&signers.get(1).unwrap(), &id);
+        client.execute_settlement(&signers.get(0).unwrap(), &id);
+
+        // The actual gap this whole fix closes: before it, execute_settlement
+        // only flipped a status flag and neither balance below would have
+        // moved at all.
+        assert_eq!(token_client.balance(&merchant), 1_000_0000i128);
+        assert_eq!(token_client.balance(&client.address), contract_balance_before - 1_000_0000i128);
+    }
+
+    #[test]
+    fn execute_settlement_traps_and_settlement_stays_pending_if_treasury_is_short() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(token_admin);
+        let token_id = sac.address();
+        let signers = vec![
+            &env,
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        let contract_id = env.register(TreasuryContract, ());
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &token_id, &signers, &2u32);
+        // Deliberately NOT funded — this is the one test in this module
+        // that doesn't use setup()'s generous mint, specifically to prove
+        // an underfunded treasury can't silently mark a settlement
+        // Executed without the money actually moving.
+        let merchant = Address::generate(&env);
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        client.approve_settlement(&signers.get(1).unwrap(), &id);
+        let res = client.try_execute_settlement(&signers.get(0).unwrap(), &id);
+        assert!(res.is_err(), "an underfunded transfer should trap, not silently succeed");
+
+        let settlement = client.get_settlement(&id);
+        assert_eq!(settlement.status, SettlementStatus::Pending, "a reverted execute must leave the settlement Pending, not Executed");
+    }
+
+    #[test]
+    fn approve_settlement_event_records_approving_signer() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{IntoVal, Val};
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, _token) = setup(&env);
+        let merchant = Address::generate(&env);
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        let approver = signers.get(1).unwrap();
+        client.approve_settlement(&approver, &id);
+
+        let topics: soroban_sdk::Vec<Val> = (symbol_short!("approved"), approver.clone()).into_val(&env);
+        let data: Val = id.into_val(&env);
+        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+}

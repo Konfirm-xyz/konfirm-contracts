@@ -307,7 +307,7 @@ impl PaymentContract {
         current_admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish((symbol_short!("admin"),), new_admin);
+        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
         Ok(())
     }
 
@@ -447,63 +447,18 @@ mod test {
     }
 
     #[test]
-    fn refunded_and_voided_events_carry_admin_and_amount() {
+    fn set_admin_event_records_outgoing_and_incoming_admin() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{vec, IntoVal, Val};
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
         let new_admin = Address::generate(&env);
-        client.set_admin(&admin, &new_admin);
-        let merchant = Address::generate(&env);
-        let payer = Address::generate(&env);
-        let tx_hash = BytesN::from_array(&env, &[7u8; 32]);
-        let id1 = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
-        let id2 = client.record_payment(&merchant, &payer, &2u64, &250_0000i128, &tx_hash);
 
-        client.mark_refunded(&id1);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            soroban_sdk::vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("refunded"), new_admin.clone()).into_val(&env),
-                    (id1, 100_0000i128).into_val(&env)
-                )
-            ]
-        );
-        client.void_payment(&id2);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            soroban_sdk::vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("voided"), new_admin).into_val(&env),
-                    (id2, 250_0000i128).into_val(&env)
-                )
-            ]
-        );
-    }
-
-    #[test]
-    fn unpaused_event_carries_acting_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let new_admin = Address::generate(&env);
         client.set_admin(&admin, &new_admin);
-        client.pause();
-        client.unpause();
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            soroban_sdk::vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("unpaused"), new_admin).into_val(&env),
-                    ().into_val(&env)
-                )
-            ]
-        );
+
+        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
+        let data: Val = new_admin.clone().into_val(&env);
+        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
     }
 }

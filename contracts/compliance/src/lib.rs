@@ -203,7 +203,7 @@ impl ComplianceContract {
         current_admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        AdminChangedEvent { new_admin }.publish(&env);
+        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
         Ok(())
     }
 
@@ -255,6 +255,75 @@ mod test {
         client.allow_address(&addr);
         assert!(client.is_allowed(&addr));
         client.clear_address(&addr);
+        assert!(client.is_allowed(&ad
+
+        client.block_address(&addr);
+        client.pause();
+        // must not panic / must not require unpausing to read
+        assert!(!client.is_allowed(&addr));
+    }
+
+    #[test]
+    fn mutations_rejected_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let addr = Address::generate(&env);
+
+        client.pause();
+        let res = client.try_block_address(&addr);
+        assert_eq!(res, Err(Ok(ComplianceError::Paused)));
+        let res = client.try_allow_address(&addr);
+        assert_eq!(res, Err(Ok(ComplianceError::Paused)));
+        let res = client.try_clear_address(&addr);
+        assert_eq!(res, Err(Ok(ComplianceError::Paused)));
+    }
+
+    #[test]
+    fn double_initialize_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let res = client.try_initialize(&admin);
+        assert_eq!(res, Err(Ok(ComplianceError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn non_admin_signer_cannot_call_admin_function() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let non_admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+
+        // Only a non-admin address authorizes the call; the admin's
+        // require_auth() must therefore fail.
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "block_address",
+                args: (addr.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_block_address(&addr).is_err());
         assert!(client.is_allowed(&addr));
+    }
+
+    #[test]
+    fn set_admin_event_records_outgoing_and_incoming_admin() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{vec, Val};
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
+        let data: Val = new_admin.clone().into_val(&env);
+        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
     }
 }
