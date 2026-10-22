@@ -107,6 +107,11 @@ impl PaymentContract {
     ///
     /// Fails with `InvalidAmount` if `amount <= 0`, `DuplicateTxHash` if
     /// `tx_hash` was already recorded, and `Paused` while paused.
+    ///
+    /// The five flat parameters are deliberate (#47): replacing them with an
+    /// input struct would break the deployed contract's ABI, and flat args keep
+    /// `stellar contract invoke -- record_payment --merchant ...` usable. See
+    /// `docs/architecture.md`.
     pub fn record_payment(
         env: Env,
         merchant: Address,

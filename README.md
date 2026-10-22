@@ -32,7 +32,7 @@ Default-allow: an address is permitted unless explicitly blocked. `clear_address
 | Function | Signature |
 |---|---|
 | `initialize` | `(admin: Address)` |
-| `record_payment` | see `lib.rs` — writes a payment record |
+| `record_payment` | `(merchant: Address, payer: Address, link_id: u64, amount: i128, tx_hash: BytesN<32>) -> u64` — writes a payment record; flat params kept on purpose, see `docs/architecture.md` (#47) |
 | `mark_refunded` | `(payment_id: u64)` — rejects a second refund on the same ID |
 | `get_payment` | `(payment_id: u64) -> PaymentRecord` |
 | `set_admin` | `(current_admin: Address, new_admin: Address)` — both must authorize; not pause-gated |
