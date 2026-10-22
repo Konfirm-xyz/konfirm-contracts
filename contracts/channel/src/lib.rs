@@ -414,6 +414,7 @@ impl ChannelContract {
     /// (treasury's 2-of-3 model) or a multisig deployer account is what closes
     /// that gap; see docs/KEYS.md.
     pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), ChannelError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
