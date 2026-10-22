@@ -71,22 +71,26 @@ The deployed instance uses `challenge_period_secs = 86400` (24 hours). Shorter/l
 
 ## Deployed addresses (Testnet)
 
+Redeployed 2026-10-22 (PRD M1) from commit `851fa1a1260c83a5d8dfd896b5f8c33932d26ab5` — the last commit confirmed to build and pass its full test suite. The tip of `main` at redeploy time (`1583b79`) did not compile; see [konfirm-contracts#237](https://github.com/Konfirm-xyz/konfirm-contracts/issues/237). Each address below was verified with `stellar contract info interface` against this exact source commit.
+
 | Contract | Address |
 |---|---|
-| Compliance | `CDDVLE2DZQAYFY3Z2Z74TUNNPC4ROUACSBXOB2P64IT75EZFAQXSRSXY` |
-| Payment | `CCYRA6JT2L4NS5FG4B5TP52JPCGCPYSP7M6LUDUY2QA37V5UBXWJBRHV` |
-| Treasury | `CD77HPVBGIRYQGXC4JVCEO35X6FKFFJ2C4EZ63EQCOXGR6OL4TVEPZ2T` |
-| Channel | `CDS2Y4CQMQWFLCG5GHVKX7UIXHYPM6IJDJZTEXSASSHGHLESGLGLNPL6` |
+| Compliance | `CCDMRUZ2JSP7LKGKE7MGOTLKM26IMX6OYJBD7XQHZPKFZMXKOZ32OZ7A` |
+| Payment | `CDUDDS5OZKJSB7UO7MYU6MMSUQ4YN5Z3UKFV6GSLDM2HYTMCH7LKRZRH` |
+| Treasury | `CDPSQANQMGKE4XRVRZHE57HBWKRJ6KKWAUJ6TBVMZYJ47GZTIOO2KLT4` |
+| Channel | `CCFIIEFAAYNKDABKKI2N5Z7MZDMQY7Q5BD6BMIZDE5SNKW6JCLC63GOC` |
 
 Deployer: `GAEMG5TVLEIQYCY3XB4EJT742DIE3FQO53RSESSYJQUZIWZOJQIZATJS`
 
 Treasury signers (2-of-3 threshold): `GAEMG5TVLEIQYCY3XB4EJT742DIE3FQO53RSESSYJQUZIWZOJQIZATJS`, `GBRUR4UZHKPQ76S4S7X7INENL6QJ4UGNFIQ3F6VAYJQZRO3F4XBZAIND`, `GCP57AJNZIVVTPPSD4MJ2SQDMTN4QEAUP64U2OZ4HXSAU4O4A6NOWY2Z`
 
+Treasury was initialized with the real testnet USDC SAC (`CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA`). The channel contract's token allowlist (`set_token_allowed`) was set for both testnet USDC (above) and testnet EURC (`CCUUDM434BMZMYWYDITHFXHDMIVTGGD6T2I5UKNX5BSLXLW7HVR4MCGZ`, derived from issuer `GB3Q6QDZYTHWT7E5PVS3W7FUT5GVAFC5KSZFFLPU25GO7VTC3NM2ZTVO` via `stellar contract id asset`).
+
 ## Tech stack
 
 - Rust, `soroban-sdk 27.0.5`
 - `#![no_std]` contracts — no heap allocation, no std library
-- 27 unit tests across the four contracts using `soroban-sdk`'s `testutils`
+- 36 unit tests across the four contracts using `soroban-sdk`'s `testutils` (at `851fa1a`; the figure below was stale before this redeploy)
 
 ## Prerequisites
 
