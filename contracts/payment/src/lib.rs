@@ -379,6 +379,20 @@ mod test {
     }
 
     #[test]
+    fn duplicate_tx_hash_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[4u8; 32]);
+
+        let _id = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+        let res = client.try_record_payment(&merchant, &payer, &2u64, &200_0000i128, &tx_hash);
+        assert_eq!(res, Err(Ok(PaymentError::DuplicateTxHash)));
+    }
+
+    #[test]
     fn double_refund_rejected() {
         let env = Env::default();
         env.mock_all_auths();
