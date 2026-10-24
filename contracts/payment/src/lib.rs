@@ -322,6 +322,7 @@ impl PaymentContract {
 
     /// Admin-only. Lifts a pause set by `pause`. Callable while paused.
     pub fn unpause(env: Env) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin = Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events().publish((symbol_short!("unpaused"), admin), ());
@@ -337,6 +338,7 @@ impl PaymentContract {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
 
@@ -460,5 +462,26 @@ mod test {
         let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
         let data: Val = new_admin.clone().into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    #[test]
+    fn unpause_extends_instance_ttl() {
+        use soroban_sdk::testutils::Ledger as _;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        // The test ledger gives an entry a 4095-ledger TTL, and `extend_ttl`
+        // does nothing while the remaining TTL stays at or above
+        // `TTL_THRESHOLD`. Move the ledger far enough that the instance TTL
+        // falls below the threshold, so a missing extension is observable.
+        env.ledger().set_sequence_number(4_000);
+
+        // No prior `pause` call on purpose: `pause` extends the TTL itself,
+        // which would mask an extension missing from `unpause`.
+        client.unpause();
+
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert_eq!(ttl, TTL_EXTEND_TO);
     }
 }
