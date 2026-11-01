@@ -1,6 +1,6 @@
 #![no_std]
 
-use konfirm_common::{require_not_paused, set_paused, CommonError};
+use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
 use soroban_sdk::{contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env, Vec};
 
 const TTL_THRESHOLD: u32 = 100;
@@ -9,6 +9,15 @@ const TTL_EXTEND_TO: u32 = 5_000_000;
 /// Maximum lifetime (in ledgers) a settlement may stay `Pending` before it
 /// becomes eligible for permissionless cleanup via `sweep_expired_settlement`.
 const MAX_PENDING_LIFETIME: u64 = 17_280; // ~1 day at 5s/ledger
+
+// Minimal cross-contract client for the compliance contract's `is_allowed`.
+// The compliance contract address is supplied by the admin at
+// `set_compliance` time so this contract can consult the blocklist before
+// a settlement proposes or pays out to a blocked merchant.
+#[contractclient(name = "ComplianceClient")]
+pub trait ComplianceInterface {
+    fn is_allowed(env: Env, address: Address) -> bool;
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +71,7 @@ pub enum TreasuryError {
     InvalidThreshold = 11,
     DuplicateSigner = 12,
     NotExpired = 13,
+    ComplianceBlocked = 14,
 }
 
 impl From<CommonError> for TreasuryError {
@@ -122,7 +132,9 @@ impl TreasuryContract {
     pub fn set_compliance(env: Env, compliance: Address) -> Result<(), TreasuryError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Compliance, &compliance);
-        env.events().publish((symbol_short!("compliance"),), compliance);
+        // "compliance" is 10 chars, over Soroban's 9-char symbol_short cap;
+        // "complset" ("compliance set") keeps the intent within the limit.
+        env.events().publish((symbol_short!("complset"),), compliance);
         Ok(())
     }
 
@@ -279,8 +291,8 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Read-only view. Returns the treasury's current token balance minus the
-    /// sum of `amount` across every still-`Pending` settlement. This is the
+    /// Permissionless. Read-only view. Returns the treasury's current token
+    /// balance minus the sum of `amount` across every still-`Pending` settlement. This is the
     /// balance available to a newly-approved settlement after already-pending
     /// settlements' first claim. A negative result means the treasury is
     /// over-committed: some pending settlements cannot be paid in full even
@@ -290,19 +302,19 @@ impl TreasuryContract {
         Self::token_balance(&env) - Self::pending_committed(&env)
     }
 
-    /// Read-only view. Returns the total amount committed to still-`Pending`
-    /// settlements (their first claim on the treasury balance).
+    /// Permissionless. Read-only view. Returns the total amount committed to
+    /// still-`Pending` settlements (their first claim on the treasury balance).
     pub fn committed_balance(env: Env) -> i128 {
         Self::pending_committed(&env)
     }
 
-    /// Read-only view. Reports whether `settlement_id` is currently payable in
-    /// full given the treasury balance and the first claim of all *other*
-    /// still-`Pending` settlements. Returns `false` for a missing or
-    /// non-`Pending` settlement. This is a proactive signal: `execute_settlement`
-    /// traps rather than falsely succeeding when a settlement is underfunded,
-    /// so callers should consult this before relying on a settlement being
-    /// payable.
+    /// Permissionless. Read-only view. Reports whether `settlement_id` is
+    /// currently payable in full given the treasury balance and the first
+    /// claim of all *other* still-`Pending` settlements. Returns `false` for
+    /// a missing or non-`Pending` settlement. This is a proactive signal:
+    /// `execute_settlement` traps rather than falsely succeeding when a
+    /// settlement is underfunded, so callers should consult this before
+    /// relying on a settlement being payable.
     pub fn is_settlement_payable(env: Env, settlement_id: u64) -> bool {
         let settlement: Settlement = match env
             .storage()
@@ -319,7 +331,148 @@ impl TreasuryContract {
         Self::token_balance(&env) - others >= settlement.amount
     }
 
-    /// Signer-onl
+    /// Signer-only, pause-gated. Any one signer (`caller`) can execute once the
+    /// settlement's approval count reaches the threshold; fails with
+    /// `ThresholdNotMet` before then. Executing does not count as an approval.
+    /// Transfers `amount` of the payout token from the treasury to the
+    /// merchant, then marks the settlement `Executed`. If the transfer traps,
+    /// the whole call reverts and the settlement stays `Pending`. Also fails
+    /// with `NotSigner`, `NotFound`, `NotPending`, `ComplianceBlocked` if the
+    /// merchant is blocked by the configured compliance contract, and `Paused`
+    /// while paused.
+    pub fn execute_settlement(env: Env, caller: Address, settlement_id: u64) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Self::require_signer(&env, &caller)?;
+        require_not_paused(&env, &DataKey::Paused)?;
+
+        let mut settlement: Settlement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(settlement_id))
+            .ok_or(TreasuryError::NotFound)?;
+        if settlement.status != SettlementStatus::Pending {
+            return Err(TreasuryError::NotPending);
+        }
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if settlement.approvals.len() < threshold {
+            return Err(TreasuryError::ThresholdNotMet);
+        }
+        Self::require_allowed(&env, &settlement.merchant)?;
+
+        // Transfer before marking Executed, same order-of-operations
+        // channel::checkpoint already uses — if the transfer traps (e.g.
+        // this contract's own balance is somehow short), the whole call
+        // reverts and the settlement stays Pending rather than being
+        // marked paid out when it wasn't.
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(TreasuryError::NotInitialized)?;
+        token::Client::new(&env, &token_addr).transfer(
+            &env.current_contract_address(),
+            &settlement.merchant,
+            &settlement.amount,
+        );
+
+        settlement.status = SettlementStatus::Executed;
+        let merchant = settlement.merchant.clone();
+        let amount = settlement.amount;
+        Self::save_settlement(&env, settlement_id, &settlement);
+        // Carries the merchant and amount, not just the id (issue #76): a
+        // listener otherwise has to look the settlement back up to know what
+        // was actually paid out.
+        env.events().publish((symbol_short!("executed"), merchant), (settlement_id, amount));
+        Ok(())
+    }
+
+    /// Permissionless. Read-only and not pause-gated. Returns the settlement,
+    /// or `NotFound` for an unknown id.
+    pub fn get_settlement(env: Env, settlement_id: u64) -> Result<Settlement, TreasuryError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Settlement(settlement_id))
+            .ok_or(TreasuryError::NotFound)
+    }
+
+    /// Permissionless. Transitions a `Pending` settlement that has outlived
+    /// `MAX_PENDING_LIFETIME` to `Cancelled`, mirroring `channel`'s
+    /// `finalize_close` cleanup pattern. Anyone may call this; no auth is
+    /// required. Fails with `NotFound`, `NotPending` if the settlement is not
+    /// `Pending`, and `NotExpired` if it is still within its lifetime.
+    pub fn sweep_expired_settlement(env: Env, settlement_id: u64) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let mut settlement: Settlement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(settlement_id))
+            .ok_or(TreasuryError::NotFound)?;
+        if settlement.status != SettlementStatus::Pending {
+            return Err(TreasuryError::NotPending);
+        }
+        let now = env.ledger().timestamp();
+        if now < settlement.proposed_at.saturating_add(MAX_PENDING_LIFETIME) {
+            return Err(TreasuryError::NotExpired);
+        }
+
+        settlement.status = SettlementStatus::Cancelled;
+        Self::save_settlement(&env, settlement_id, &settlement);
+        env.events().publish((symbol_short!("expired"),), settlement_id);
+        Ok(())
+    }
+
+    /// Admin-only. Blocks `propose_settlement`, `approve_settlement` and
+    /// `execute_settlement` until unpaused. Reads keep working while paused.
+    pub fn pause(env: Env) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Admin-only. Lifts a pause set by `pause`. Callable while paused.
+    pub fn unpause(env: Env) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Permissionless. Read-only. Returns whether the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (TreasuryContractClient<'_>, Address, Vec<Address>, Address) {
+        let admin = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let sac = env.register_stellar_asset_contract_v2(token_admin);
+        let token_id = sac.address();
+        let signers = vec![
+            env,
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+        ];
+        let contract_id = env.register(TreasuryContract, ());
+        let client = TreasuryContractClient::new(env, &contract_id);
+        client.initialize(&admin, &token_id, &signers, &2u32);
+        // Fund the treasury itself so execute_settlement's real transfer has
+        // something to pay out.
+        token::StellarAssetClient::new(env, &token_id).mint(&contract_id, &100_000_0000i128);
+        (client, admin, signers, token_id)
+    }
 
     #[test]
     fn zero_threshold_rejected_at_init() {
@@ -407,3 +560,6 @@ impl TreasuryContract {
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
     }
 }
+
+#[cfg(test)]
+mod executed_event_test;
