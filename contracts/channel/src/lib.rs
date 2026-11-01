@@ -554,9 +554,10 @@ mod test {
         env.ledger().with_mut(|l| l.timestamp += 3_601);
         client.finalize_close(&id);
 
-        let token_client = token::TokenClient::new(&env, &token_id);
-        assert_eq!(token_client.balance(&payer), 1_000_0000i128);
-        assert_eq!(token_client.balance(&contract_id), 0i128);
+        // Check events right after finalize_close: a Soroban test env scopes
+        // recorded events to the most recent top-level invocation, so the
+        // token balance reads below (each a cross-contract call of their
+        // own) would otherwise clear them before this assertion ran.
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
@@ -568,6 +569,9 @@ mod test {
                 )
             ]
         );
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&payer), 1_000_0000i128);
+        assert_eq!(token_client.balance(&contract_id), 0i128);
     }
 
     #[test]
@@ -872,8 +876,10 @@ mod test {
 
         client.top_up(&payer, &id, &200_0000i128);
 
-        let ch = client.get_channel_info(&id);
-        assert_eq!(ch.deposited, 700_0000i128);
+        // Check events right after the call that emits them: a Soroban test
+        // env scopes recorded events to the most recent top-level invocation,
+        // so a read-only call like get_channel_info() in between would
+        // otherwise clear them before this assertion ever ran.
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
@@ -885,8 +891,10 @@ mod test {
                 )
             ]
         );
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.deposited, 700_0000i128);
+
         client.top_up(&payer, &id, &100_0000i128);
-        assert_eq!(client.get_channel_info(&id).deposited, 800_0000i128);
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
@@ -898,10 +906,11 @@ mod test {
                 )
             ]
         );
+        assert_eq!(client.get_channel_info(&id).deposited, 800_0000i128);
 
         let token_client = token::TokenClient::new(&env, &token_id);
-        assert_eq!(token_client.balance(&contract_id), 700_0000i128);
-        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 700_0000i128);
+        assert_eq!(token_client.balance(&contract_id), 800_0000i128);
+        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 800_0000i128);
     }
 
     #[test]
