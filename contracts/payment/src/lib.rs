@@ -1,7 +1,7 @@
 #![no_std]
 
 use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contract, contractclient, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env};
 
 // This contract is an attestation layer, not an escrow. Funds for a checkout
 // payment move directly payer -> merchant muxed address via a classic
@@ -126,7 +126,9 @@ impl PaymentContract {
     pub fn set_compliance(env: Env, compliance: Address) -> Result<(), PaymentError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Compliance, &compliance);
-        env.events().publish((symbol_short!("compliance"),), compliance);
+        // "compliance" is 10 chars, over Soroban's 9-char symbol_short cap;
+        // "complset" ("compliance set") keeps the intent within the limit.
+        env.events().publish((symbol_short!("complset"),), compliance);
         Ok(())
     }
 
@@ -238,18 +240,19 @@ impl PaymentContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin = Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
-        if !env.storage().persistent().has(&DataKey::Payment(payment_id)) {
-            return Err(PaymentError::NotFound);
-        }
+        let record: PaymentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(PaymentError::NotFound)?;
         if Self::is_refunded_flag(&env, payment_id) {
             return Err(PaymentError::AlreadyRefunded);
         }
         if Self::is_voided_flag(&env, payment_id) {
             return Err(PaymentError::Voided);
         }
-        record.refunded = true;
-        env.storage().persistent().set(&DataKey::Payment(payment_id), &record);
-        env.storage().persistent().extend_ttl(&DataKey::Payment(payment_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().set(&DataKey::Refunded(payment_id), &true);
+        env.storage().persistent().extend_ttl(&DataKey::Refunded(payment_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.events().publish((symbol_short!("refunded"), admin), (payment_id, record.amount));
         Ok(())
     }
@@ -262,9 +265,11 @@ impl PaymentContract {
     pub fn void_payment(env: Env, payment_id: u64) -> Result<(), PaymentError> {
         let admin = Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
-        if !env.storage().persistent().has(&DataKey::Payment(payment_id)) {
-            return Err(PaymentError::NotFound);
-        }
+        let record: PaymentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(PaymentError::NotFound)?;
         if Self::is_voided_flag(&env, payment_id) {
             return Err(PaymentError::AlreadyVoided);
         }
@@ -284,6 +289,25 @@ impl PaymentContract {
     // Raw refunded flag; `false` for unknown ids. Callers check existence first.
     fn is_refunded_flag(env: &Env, payment_id: u64) -> bool {
         env.storage().persistent().get(&DataKey::Refunded(payment_id)).unwrap_or(false)
+    }
+
+    /// Permissionless. Read-only and not pause-gated. Returns whether the
+    /// payment was voided, or `NotFound` for an unknown id.
+    pub fn is_voided(env: Env, payment_id: u64) -> Result<bool, PaymentError> {
+        if !env.storage().persistent().has(&DataKey::Payment(payment_id)) {
+            return Err(PaymentError::NotFound);
+        }
+        Ok(Self::is_voided_flag(&env, payment_id))
+    }
+
+    /// Permissionless. Read-only and not pause-gated. Returns the stored
+    /// record, or `NotFound` for an unknown id. Does not reflect `is_voided`
+    /// or the separate `Refunded`/`Voided` flags.
+    pub fn get_payment(env: Env, payment_id: u64) -> Result<PaymentRecord, PaymentError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(PaymentError::NotFound)
     }
 
     /// Rotates the admin key. Requires auth from both the current admin and
@@ -460,5 +484,47 @@ mod test {
         let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
         let data: Val = new_admin.clone().into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    #[test]
+    fn refunded_and_voided_events_carry_admin_and_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let new_admin = Address::generate(&env);
+        client.set_admin(&admin, &new_admin);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        // Two distinct tx hashes: record_payment rejects a repeated hash with
+        // DuplicateTxHash, so both calls using the same one would panic.
+        let tx_hash1 = BytesN::from_array(&env, &[7u8; 32]);
+        let tx_hash2 = BytesN::from_array(&env, &[8u8; 32]);
+        let id1 = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash1);
+        let id2 = client.record_payment(&merchant, &payer, &2u64, &250_0000i128, &tx_hash2);
+
+        client.mark_refunded(&id1);
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (symbol_short!("refunded"), new_admin.clone()).into_val(&env),
+                    (id1, 100_0000i128).into_val(&env)
+                )
+            ]
+        );
+        client.void_payment(&id2);
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (symbol_short!("voided"), new_admin).into_val(&env),
+                    (id2, 250_0000i128).into_val(&env)
+                )
+            ]
+        );
     }
 }
