@@ -7,11 +7,11 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "=27.0.5"
+soroban-sdk = "=29.0.1"
 konfirm-common = { path = "../common" }
 
 [dev-dependencies]
-soroban-sdk = { version = "=27.0.5", features = ["testutils"] }
+soroban-sdk = { version = "=29.0.1", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
