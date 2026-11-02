@@ -18,7 +18,7 @@ fn setup() -> (Env, TreasuryContractClient<'static>, Address, Address, Address, 
     let sac = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_addr = sac.address();
 
-    let contract_id = env.register_contract(None, TreasuryContract);
+    let contract_id = env.register(TreasuryContract, ());
     let client = TreasuryContractClient::new(&env, &contract_id);
 
     let mut signers = Vec::new(&env);
@@ -42,32 +42,21 @@ fn executed_event_carries_amount_and_merchant() {
     client.approve_settlement(&signer_b, &id);
     client.execute_settlement(&signer_a, &id);
 
+    // Check events right after execute_settlement: a Soroban test env scopes
+    // recorded events to the most recent top-level invocation, so the token
+    // balance read below (a cross-contract call of its own) would otherwise
+    // clear them before this assertion ran.
+    //
+    // The `executed` event's topic carries the merchant and its data carries
+    // the settlement id and the paid amount.
+    let topics: Vec<Val> = (Symbol::new(&env, "executed"), merchant.clone()).into_val(&env);
+    let data: Val = (id, amount).into_val(&env);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![&env, (client.address.clone(), topics, data)]
+    );
+
     // The merchant actually received the funds.
     let token = TokenClient::new(&env, &token_addr);
     assert_eq!(token.balance(&merchant), amount);
-
-    // Find the `executed` event and assert its topic/data match the payout.
-    let executed_topic = Symbol::new(&env, "executed");
-    let mut found = false;
-    for (contract, topics, data) in env.events().all().iter() {
-        if contract != client.address {
-            continue;
-        }
-        let topics_vec: Vec<Val> = topics;
-        if topics_vec.len() != 2 {
-            continue;
-        }
-        let topic0: Symbol = topics_vec.get(0).unwrap().into_val(&env);
-        if topic0 != executed_topic {
-            continue;
-        }
-        let topic_merchant: Address = topics_vec.get(1).unwrap().into_val(&env);
-        assert_eq!(topic_merchant, merchant);
-
-        let (event_id, event_amount): (u64, i128) = data.into_val(&env);
-        assert_eq!(event_id, id);
-        assert_eq!(event_amount, amount);
-        found = true;
-    }
-    assert!(found, "executed event was not emitted");
 }

@@ -1,7 +1,7 @@
 #![no_std]
 
 use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env};
 
 const TTL_THRESHOLD: u32 = 100;
 const TTL_EXTEND_TO: u32 = 5_000_000;
@@ -241,7 +241,23 @@ mod test {
 
     fn setup(env: &Env) -> (ComplianceContractClient<'_>, Address) {
         let admin = Address::generate(env);
-        le
+        let contract_id = env.register(ComplianceContract, ());
+        let client = ComplianceContractClient::new(env, &contract_id);
+        client.initialize(&admin);
+        (client, admin)
+    }
+
+    #[test]
+    fn default_allow_until_blocked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let addr = Address::generate(&env);
+
+        assert!(client.is_allowed(&addr));
+        client.block_address(&addr);
+        assert!(!client.is_allowed(&addr));
+    }
 
     #[test]
     fn clear_restores_default_allow() {
@@ -255,7 +271,15 @@ mod test {
         client.allow_address(&addr);
         assert!(client.is_allowed(&addr));
         client.clear_address(&addr);
-        assert!(client.is_allowed(&ad
+        assert!(client.is_allowed(&addr));
+    }
+
+    #[test]
+    fn is_allowed_works_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let addr = Address::generate(&env);
 
         client.block_address(&addr);
         client.pause();
