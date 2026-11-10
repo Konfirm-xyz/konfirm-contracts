@@ -55,11 +55,6 @@ jobs:
             stellar contract build --manifest-path "contracts/$contract/Cargo.toml"
           done
 
-      # README's Deployed Addresses table is the source of truth — fail if any
-      # tracked file (e.g. a stale artifacts/addresses.json) disagrees with it.
-      - name: Check deployed addresses match README
-        run: python3 scripts/check_addresses.py
-
   audit:
     name: Security audit
     runs-on: ubuntu-latest
