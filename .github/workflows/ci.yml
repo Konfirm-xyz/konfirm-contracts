@@ -45,10 +45,14 @@ jobs:
         # package just to satisfy a dependency this job never uses.
         run: cargo install --locked stellar-cli --no-default-features
       - name: Build contracts for wasm32v1-none
+        # `stellar contract build` now always builds for wasm32v1-none itself
+        # (it's a cargo wrapper that selects that target and the release
+        # profile) -- the current CLI rejects an explicit --target flag with
+        # "unexpected argument '--target' found".
         run: |
           for contract in common payment compliance treasury channel; do
             echo "Building contracts/$contract"
-            stellar contract build --target wasm32v1-none --manifest-path "contracts/$contract/Cargo.toml"
+            stellar contract build --manifest-path "contracts/$contract/Cargo.toml"
           done
 
       # README's Deployed Addresses table is the source of truth — fail if any
