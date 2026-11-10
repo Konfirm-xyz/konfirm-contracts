@@ -34,14 +34,16 @@ jobs:
       - name: Install Stellar CLI
         # `stellar-cli` renamed its `opt` feature (wasm-opt support) to
         # `additional-libs` and made it a default feature somewhere between
-        # the version this workflow was written against and the current
-        # v28.1.0 — `--features opt` now fails outright with "the package
-        # 'stellar-cli' does not contain this feature: opt" (confirmed via
-        # the crate's published Cargo.toml: features are `default`
-        # (= `additional-libs`, which pulls in `dep:wasm-opt`) and
-        # `emulator-tests`; there is no `opt` feature any more). wasm-opt is
-        # already enabled by default, so no feature flag is needed at all.
-        run: cargo install --locked stellar-cli
+        # the version this workflow was written against and v28.1.0 --
+        # `--features opt` fails outright with "the package 'stellar-cli'
+        # does not contain this feature: opt". Default features also pull in
+        # `keyring`, whose Linux backend needs system libdbus (via
+        # pkg-config) that this runner doesn't have, failing the build on
+        # `libdbus-sys`. This job only ever runs `stellar contract build`
+        # below, which needs none of wasm-opt/keyring/stellar-ledger --
+        # skip all default features instead of adding an unrelated system
+        # package just to satisfy a dependency this job never uses.
+        run: cargo install --locked stellar-cli --no-default-features
       - name: Build contracts for wasm32v1-none
         run: |
           for contract in common payment compliance treasury channel; do
