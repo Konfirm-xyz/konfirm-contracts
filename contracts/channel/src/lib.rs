@@ -2,7 +2,7 @@
 
 use konfirm_common::{require_not_paused, CommonError};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
     BytesN, Env,
 };
 
@@ -30,6 +30,83 @@ const TTL_EXTEND_TO: u32 = 5_000_000;
 // channel is persistent storage the operator pays to keep alive, so this
 // bounds how much any one account can make the protocol carry for free.
 const MAX_OPEN_CHANNELS_PER_PAYER: u32 = 20;
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InitEvent {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelOpenedEvent {
+    #[topic]
+    pub payer: Address,
+    #[topic]
+    pub payee: Address,
+    pub channel_id: u64,
+    pub deposit: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopUpEvent {
+    pub channel_id: u64,
+    pub amount: i128,
+    pub deposited: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckpointEvent {
+    pub channel_id: u64,
+    pub delta: i128,
+    pub cumulative_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosingEvent {
+    pub channel_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelClosedEvent {
+    #[topic]
+    pub payer: Address,
+    pub channel_id: u64,
+    pub remainder: i128,
+    pub claimed: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldEvent {
+    pub channel_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleaseEvent {
+    pub channel_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenAllowedEvent {
+    pub token: Address,
+    pub allowed: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminRotatedEvent {
+    #[topic]
+    pub current_admin: Address,
+    pub new_admin: Address,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +164,7 @@ pub enum ChannelError {
     TokenNotAllowed = 13,
     TooManyOpenChannels = 14,
     InvalidChallengePeriod = 15,
+    DepositOverflow = 16,
 }
 
 impl From<CommonError> for ChannelError {
@@ -119,7 +197,7 @@ impl ChannelContract {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::ChallengePeriod, &challenge_period_secs);
         env.storage().instance().set(&DataKey::NextId, &1u64);
-        env.events().publish((symbol_short!("init"),), admin);
+        InitEvent { admin: admin.clone() }.publish(&env);
         Ok(())
     }
 
@@ -227,7 +305,7 @@ impl ChannelContract {
         };
         Self::save_channel(&env, id, &channel);
         Self::save_open_count(&env, &payer, open_count + 1);
-        env.events().publish((symbol_short!("opened"), payer, payee), (id, deposit));
+        ChannelOpenedEvent { payer: payer.clone(), payee: payee.clone(), channel_id: id, deposit }.publish(&env);
         Ok(id)
     }
 
@@ -245,10 +323,16 @@ impl ChannelContract {
         if amount <= 0 {
             return Err(ChannelError::ZeroDeposit);
         }
+        // Check for overflow before moving any funds: a payer that can't be
+        // credited for a top_up should never have their tokens pulled first.
+        let new_deposited = ch
+            .deposited
+            .checked_add(amount)
+            .ok_or(ChannelError::DepositOverflow)?;
         token::TokenClient::new(&env, &ch.token).transfer(&payer, env.current_contract_address(), &amount);
-        ch.deposited += amount;
+        ch.deposited = new_deposited;
         Self::save_channel(&env, channel_id, &ch);
-        env.events().publish((symbol_short!("topup"),), (channel_id, amount, ch.deposited));
+        TopUpEvent { channel_id, amount, deposited: ch.deposited }.publish(&env);
         Ok(())
     }
 
@@ -293,7 +377,7 @@ impl ChannelContract {
         ch.claimed = cumulative_amount;
         ch.nonce = nonce;
         Self::save_channel(&env, channel_id, &ch);
-        env.events().publish((symbol_short!("checkpt"),), (channel_id, delta, cumulative_amount));
+        CheckpointEvent { channel_id, delta, cumulative_amount }.publish(&env);
         Ok(())
     }
 
@@ -313,7 +397,7 @@ impl ChannelContract {
         ch.status = ChannelStatus::Closing;
         ch.closing_at = env.ledger().timestamp();
         Self::save_channel(&env, channel_id, &ch);
-        env.events().publish((symbol_short!("closing"),), channel_id);
+        ClosingEvent { channel_id }.publish(&env);
         Ok(())
     }
 
@@ -346,7 +430,7 @@ impl ChannelContract {
         Self::save_channel(&env, channel_id, &ch);
         let open_count = Self::get_open_count(&env, &ch.payer);
         Self::save_open_count(&env, &ch.payer, open_count.saturating_sub(1));
-        env.events().publish((symbol_short!("closed"), ch.payer.clone()), (channel_id, remainder, ch.claimed));
+        ChannelClosedEvent { payer: ch.payer.clone(), channel_id, remainder, claimed: ch.claimed }.publish(&env);
         Ok(())
     }
 
@@ -360,10 +444,12 @@ impl ChannelContract {
         if ch.status != ChannelStatus::Open && ch.status != ChannelStatus::Closing {
             return Err(ChannelError::NotOpen);
         }
-        env.storage().persistent().set(&DataKey::HeldFrom(channel_id), &ch.status);
+        let held_key = DataKey::HeldFrom(channel_id);
+        env.storage().persistent().set(&held_key, &ch.status);
+        env.storage().persistent().extend_ttl(&held_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         ch.status = ChannelStatus::Held;
         Self::save_channel(&env, channel_id, &ch);
-        env.events().publish((symbol_short!("held"),), channel_id);
+        HeldEvent { channel_id }.publish(&env);
         Ok(())
     }
 
@@ -382,7 +468,7 @@ impl ChannelContract {
         env.storage().persistent().remove(&DataKey::HeldFrom(channel_id));
         ch.status = prior;
         Self::save_channel(&env, channel_id, &ch);
-        env.events().publish((symbol_short!("release"),), channel_id);
+        ReleaseEvent { channel_id }.publish(&env);
         Ok(())
     }
 
@@ -399,7 +485,7 @@ impl ChannelContract {
         let key = DataKey::AllowedToken(token.clone());
         env.storage().persistent().set(&key, &allowed);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        env.events().publish((symbol_short!("tokenok"),), (token, allowed));
+        TokenAllowedEvent { token, allowed }.publish(&env);
         Ok(())
     }
 
@@ -414,6 +500,7 @@ impl ChannelContract {
     /// (treasury's 2-of-3 model) or a multisig deployer account is what closes
     /// that gap; see docs/KEYS.md.
     pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), ChannelError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -425,7 +512,7 @@ impl ChannelContract {
         current_admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
+        AdminRotatedEvent { current_admin, new_admin }.publish(&env);
         Ok(())
     }
 
@@ -454,7 +541,6 @@ mod test {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
-    use soroban_sdk::IntoVal;
 
     fn setup_token(env: &Env, admin: &Address) -> Address {
         // Stellar Asset Contract test token, provided by soroban-sdk testutils.
@@ -558,16 +644,16 @@ mod test {
         // recorded events to the most recent top-level invocation, so the
         // token balance reads below (each a cross-contract call of their
         // own) would otherwise clear them before this assertion ran.
+        use soroban_sdk::Event as _;
+        let expected = ChannelClosedEvent {
+            payer: payer.clone(),
+            channel_id: id,
+            remainder: 500_0000i128,
+            claimed: 0i128,
+        };
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
-            soroban_sdk::vec![
-                &env,
-                (
-                    contract_id.clone(),
-                    (symbol_short!("closed"), payer.clone()).into_val(&env),
-                    (id, 500_0000i128, 0i128).into_val(&env)
-                )
-            ]
+            [expected.to_xdr(&env, &contract_id)]
         );
         let token_client = token::TokenClient::new(&env, &token_id);
         assert_eq!(token_client.balance(&payer), 1_000_0000i128);
@@ -880,31 +966,20 @@ mod test {
         // env scopes recorded events to the most recent top-level invocation,
         // so a read-only call like get_channel_info() in between would
         // otherwise clear them before this assertion ever ran.
+        use soroban_sdk::Event as _;
+        let expected = TopUpEvent { channel_id: id, amount: 200_0000i128, deposited: 700_0000i128 };
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
-            soroban_sdk::vec![
-                &env,
-                (
-                    contract_id.clone(),
-                    (symbol_short!("topup"),).into_val(&env),
-                    (id, 200_0000i128, 700_0000i128).into_val(&env)
-                )
-            ]
+            [expected.to_xdr(&env, &contract_id)]
         );
         let ch = client.get_channel_info(&id);
         assert_eq!(ch.deposited, 700_0000i128);
 
         client.top_up(&payer, &id, &100_0000i128);
+        let expected = TopUpEvent { channel_id: id, amount: 100_0000i128, deposited: 800_0000i128 };
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
-            soroban_sdk::vec![
-                &env,
-                (
-                    contract_id.clone(),
-                    (symbol_short!("topup"),).into_val(&env),
-                    (id, 100_0000i128, 800_0000i128).into_val(&env)
-                )
-            ]
+            [expected.to_xdr(&env, &contract_id)]
         );
         assert_eq!(client.get_channel_info(&id).deposited, 800_0000i128);
 
@@ -1098,7 +1173,7 @@ mod test {
 
     #[test]
     fn set_admin_event_records_outgoing_and_incoming_admin() {
-        use soroban_sdk::{vec, IntoVal, Val};
+        use soroban_sdk::Event as _;
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -1109,8 +1184,93 @@ mod test {
 
         client.set_admin(&admin, &new_admin);
 
-        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
-        let data: Val = new_admin.clone().into_val(&env);
-        assert_eq!(env.events().all(), vec![&env, (contract_id, topics, data)]);
+        let expected = AdminRotatedEvent { current_admin: admin.clone(), new_admin: new_admin.clone() };
+        assert_eq!(env.events().all(), [expected.to_xdr(&env, &contract_id)]);
+    }
+
+    // top_up's deposit accumulation used raw `+=` with no overflow check
+    // (issue #256), which would trap the whole invocation on overflow
+    // instead of returning a typed error. checked_add must reject the
+    // overflowing top_up with ChannelError::DepositOverflow, and — because
+    // the check now runs before the token transfer — no funds may move.
+    #[test]
+    fn top_up_rejects_deposit_overflow_without_moving_funds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        // Mint the maximum possible balance so the channel can be opened
+        // with a deposit of i128::MAX, putting the very next top_up one
+        // unit away from overflowing i128.
+        token_admin_client.mint(&payer, &i128::MAX);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &86_400u64);
+        client.set_token_allowed(&token_id, &true);
+        let payer_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &i128::MAX, &None);
+
+        let res = client.try_top_up(&payer, &id, &1i128);
+        assert_eq!(res, Err(Ok(ChannelError::DepositOverflow)));
+
+        // The failed top_up must not have pulled any tokens from the payer
+        // or changed the channel's recorded deposit.
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&payer), 0i128);
+        assert_eq!(token_client.balance(&contract_id), i128::MAX);
+        assert_eq!(client.get_channel_info(&id).deposited, i128::MAX);
+    }
+
+    // issue #162's open_count/TooManyOpenChannels cap had zero coverage
+    // (issue #257): nothing proved that MAX_OPEN_CHANNELS_PER_PAYER is
+    // actually enforced, or that it is enforced per-payer rather than
+    // globally.
+    #[test]
+    fn open_channel_rejects_past_the_per_payer_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &86_400u64);
+        client.set_token_allowed(&token_id, &true);
+        let payer_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+
+        // MAX_OPEN_CHANNELS_PER_PAYER is 20 — open exactly that many.
+        for _ in 0..MAX_OPEN_CHANNELS_PER_PAYER {
+            client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &100_0000i128, &None);
+        }
+
+        // The 21st channel for the same payer must be rejected.
+        let res = client.try_open_channel(&payer, &payee, &token_id, &payer_pubkey, &100_0000i128, &None);
+        assert_eq!(res, Err(Ok(ChannelError::TooManyOpenChannels)));
+
+        // A different payer is unaffected — the cap is per-payer, not global.
+        let other_payer = Address::generate(&env);
+        token_admin_client.mint(&other_payer, &100_0000i128);
+        let other_id = client.open_channel(&other_payer, &payee, &token_id, &payer_pubkey, &100_0000i128, &None);
+        assert_eq!(client.get_channel_info(&other_id).status, ChannelStatus::Open);
+
+        // Closing one of the original payer's channels frees a slot.
+        let first_id = 1u64;
+        client.initiate_close(&payer, &first_id);
+        env.ledger().with_mut(|l| l.timestamp += 86_401);
+        client.finalize_close(&first_id);
+        let freed_id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &100_0000i128, &None);
+        assert_eq!(client.get_channel_info(&freed_id).status, ChannelStatus::Open);
     }
 }

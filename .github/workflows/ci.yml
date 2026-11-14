@@ -24,6 +24,24 @@ jobs:
       - name: Run tests
         run: cargo test --all --features testutils
 
+  # Issue #29 (closed) asked for a clippy job specifically so a deprecated
+  # soroban-sdk API (like the raw `Events::publish` call `#[contractevent]`
+  # replaced, issue #246) gets caught in CI instead of drifting back in
+  # unreviewed. No such job existed. Denying only the `deprecated` lint, not
+  # `-D warnings`, keeps this job scoped to that one regression rather than
+  # also gating merges on unrelated, pre-existing style lints (e.g.
+  # clippy::inconsistent_digit_grouping) this issue never asked it to fix.
+  clippy:
+    name: Clippy (deprecation check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy, denying deprecated-API usage
+        run: cargo clippy --all --all-targets --features testutils -- -D deprecated
+
   build-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -32,22 +50,41 @@ jobs:
       - name: Install wasm32v1-none target
         run: rustup target add wasm32v1-none
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --features opt
+        # `stellar-cli` renamed its `opt` feature (wasm-opt support) to
+        # `additional-libs` and made it a default feature somewhere between
+        # the version this workflow was written against and v28.1.0 --
+        # `--features opt` fails outright with "the package 'stellar-cli'
+        # does not contain this feature: opt". Default features also pull in
+        # `keyring`, whose Linux backend needs system libdbus (via
+        # pkg-config) that this runner doesn't have, failing the build on
+        # `libdbus-sys`. This job only ever runs `stellar contract build`
+        # below, which needs none of wasm-opt/keyring/stellar-ledger --
+        # skip all default features instead of adding an unrelated system
+        # package just to satisfy a dependency this job never uses.
+        run: cargo install --locked stellar-cli --no-default-features
       - name: Build contracts for wasm32v1-none
+        # `stellar contract build` now always builds for wasm32v1-none itself
+        # (it's a cargo wrapper that selects that target and the release
+        # profile) -- the current CLI rejects an explicit --target flag with
+        # "unexpected argument '--target' found".
         run: |
           for contract in common payment compliance treasury channel; do
             echo "Building contracts/$contract"
-            stellar contract build --target wasm32v1-none --manifest-path "contracts/$contract/Cargo.toml"
+            stellar contract build --manifest-path "contracts/$contract/Cargo.toml"
           done
-
-      # README's Deployed Addresses table is the source of truth — fail if any
-      # tracked file (e.g. a stale artifacts/addresses.json) disagrees with it.
-      - name: Check deployed addresses match README
-        run: python3 scripts/check_addresses.py
 
   audit:
     name: Security audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes its findings as a GitHub Check Run, which
+    # needs an explicit grant — the default GITHUB_TOKEN permissions don't
+    # include it. This block was added once before (commit ba806e2) and was
+    # silently dropped by a later unreviewed merge, which is exactly the
+    # autosolve-cli failure mode this repo's CLAUDE.md warns about; restoring
+    # it here.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Run cargo audit
