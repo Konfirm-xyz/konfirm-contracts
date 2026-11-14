@@ -2,8 +2,8 @@
 
 use konfirm_common::{require_not_paused, CommonError};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
-    BytesN, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Bytes, BytesN, Env,
 };
 
 // One escrow-backed unidirectional payment channel per (payer, payee, token).
@@ -30,6 +30,18 @@ const TTL_EXTEND_TO: u32 = 5_000_000;
 // channel is persistent storage the operator pays to keep alive, so this
 // bounds how much any one account can make the protocol carry for free.
 const MAX_OPEN_CHANNELS_PER_PAYER: u32 = 20;
+
+// Minimal cross-contract client for the compliance contract's `is_allowed`.
+// Mirrors payment::ComplianceInterface / treasury::ComplianceInterface
+// exactly (each contract keeps its own copy rather than sharing one via
+// konfirm_common, matching the existing pattern). The compliance contract
+// address is supplied by the admin at `set_compliance` time so this contract
+// can consult the blocklist before accepting new exposure to a payer or
+// payee.
+#[contractclient(name = "ComplianceClient")]
+pub trait ComplianceInterface {
+    fn is_allowed(env: Env, address: Address) -> bool;
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +78,7 @@ enum DataKey {
     HeldFrom(u64),
     AllowedToken(Address),
     OpenCount(Address),
+    Compliance,
 }
 
 #[contracterror]
@@ -87,6 +100,7 @@ pub enum ChannelError {
     TokenNotAllowed = 13,
     TooManyOpenChannels = 14,
     InvalidChallengePeriod = 15,
+    ComplianceBlocked = 16,
 }
 
 impl From<CommonError> for ChannelError {
@@ -133,8 +147,49 @@ impl ChannelContract {
         Ok(())
     }
 
+    /// Admin-only. Points this contract at the compliance contract consulted
+    /// by `open_channel` and `top_up` before accepting new deposits —
+    /// mirrors `payment::set_compliance` / `treasury::set_compliance`
+    /// exactly. Fails with `NotInitialized` before `initialize`.
+    pub fn set_compliance(env: Env, compliance: Address) -> Result<(), ChannelError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Compliance, &compliance);
+        // "compliance" is 10 chars, over Soroban's 9-char symbol_short cap;
+        // "complset" ("compliance set") keeps the intent within the limit.
+        env.events().publish((symbol_short!("complset"),), compliance);
+        Ok(())
+    }
+
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
         env.storage().persistent().get(&DataKey::AllowedToken(token.clone())).unwrap_or(false)
+    }
+
+    // Consults the configured compliance contract for both channel parties.
+    // No-op (advisory mode) if no compliance contract has been configured,
+    // matching payment::require_allowed / treasury::require_allowed exactly.
+    //
+    // Screens payer AND payee: open_channel/top_up are the points where new
+    // exposure to *both* parties is created (the payer's deposit becomes
+    // money the payee can later claim via checkpoint). This mirrors how
+    // `pause` gates exactly these two entry points and no others (see the
+    // module doc comment) — compliance, like pause, is a preventive control
+    // on new exposure, not a block on a withdrawal someone can already prove
+    // is owed to them. checkpoint() and finalize_close() are deliberately
+    // NOT gated here, for the same reason they are never pause-gated: a
+    // payee/payer recovering funds already escrowed under a signed claim (or
+    // an already-elapsed challenge period) must keep working even if the
+    // counterparty is later blocked, exactly as it must keep working while
+    // paused.
+    fn require_allowed(env: &Env, payer: &Address, payee: &Address) -> Result<(), ChannelError> {
+        let compliance: Address = match env.storage().instance().get(&DataKey::Compliance) {
+            Some(addr) => addr,
+            None => return Ok(()),
+        };
+        let client = ComplianceClient::new(env, &compliance);
+        if !client.is_allowed(&payer.clone()) || !client.is_allowed(&payee.clone()) {
+            return Err(ChannelError::ComplianceBlocked);
+        }
+        Ok(())
     }
 
     fn get_channel(env: &Env, id: u64) -> Result<Channel, ChannelError> {
@@ -207,6 +262,7 @@ impl ChannelContract {
         if open_count >= MAX_OPEN_CHANNELS_PER_PAYER {
             return Err(ChannelError::TooManyOpenChannels);
         }
+        Self::require_allowed(&env, &payer, &payee)?;
 
         token::TokenClient::new(&env, &token).transfer(&payer, env.current_contract_address(), &deposit);
 
@@ -245,6 +301,7 @@ impl ChannelContract {
         if amount <= 0 {
             return Err(ChannelError::ZeroDeposit);
         }
+        Self::require_allowed(&env, &ch.payer, &ch.payee)?;
         token::TokenClient::new(&env, &ch.token).transfer(&payer, env.current_contract_address(), &amount);
         ch.deposited += amount;
         Self::save_channel(&env, channel_id, &ch);
@@ -1114,3 +1171,6 @@ mod test {
         assert_eq!(env.events().all(), vec![&env, (contract_id, topics, data)]);
     }
 }
+
+#[cfg(test)]
+mod compliance_integration_test;

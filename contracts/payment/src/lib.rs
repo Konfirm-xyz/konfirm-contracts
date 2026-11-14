@@ -528,3 +528,6 @@ mod test {
         );
     }
 }
+
+#[cfg(test)]
+mod compliance_integration_test;

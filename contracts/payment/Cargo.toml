@@ -12,6 +12,10 @@ konfirm-common = { path = "../common" }
 
 [dev-dependencies]
 soroban-sdk = { version = "=27.0.5", features = ["testutils"] }
+# Needed only to register ComplianceContract alongside PaymentContract in a
+# same-Env integration test (issue #254). payment calls compliance by
+# runtime Address, not a Cargo dependency, so this is test-only.
+konfirm-compliance = { path = "../compliance" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
