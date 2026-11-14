@@ -59,7 +59,9 @@ enum DataKey {
 pub enum TreasuryError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
-    /// Never returned: admin/signer gates use `require_auth()`, which traps at the host before this can be produced. Code 3 stays reserved for ABI stability.
+    /// Returned by `set_admin` when `current_admin` does not match the
+    /// stored admin. Other admin/signer gates use `require_auth()`, which
+    /// traps at the host before this can be produced.
     Unauthorized = 3,
     Paused = 4,
     NotFound = 5,
@@ -426,6 +428,42 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Rotates the admin key. Requires auth from both the current admin and
+    /// the incoming one, so a handoff can't strand the contract on an
+    /// address nobody holds. Deliberately not pause-gated: rotating away
+    /// from a suspected key must still work during an incident. Mirrors
+    /// `compliance::set_admin` / `payment::set_admin` / `channel::set_admin`
+    /// exactly (issue #253 — treasury was the one contract of the four
+    /// missing this).
+    ///
+    /// This governs only the single `Admin` key that gates `pause`,
+    /// `unpause`, and `set_compliance` — it has no effect on the
+    /// `Signers`/`Threshold` multisig that gates settlement
+    /// proposal/approval/execution, which is fixed at `initialize` and out
+    /// of scope here (tracked separately in #169).
+    ///
+    /// This does NOT defend against a leaked current admin key on its own —
+    /// that key can still rotate to an attacker-held address. This
+    /// contract's own signer quorum does not gate the Admin key itself; a
+    /// multisig deployer/admin account is what would close that gap; see
+    /// docs/KEYS.md.
+    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if current_admin != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+        current_admin.require_auth();
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
+        Ok(())
+    }
+
     /// Admin-only. Blocks `propose_settlement`, `approve_settlement` and
     /// `execute_settlement` until unpaused. Reads keep working while paused.
     pub fn pause(env: Env) -> Result<(), TreasuryError> {
@@ -558,6 +596,67 @@ mod test {
         let topics: soroban_sdk::Vec<Val> = (symbol_short!("approved"), approver.clone()).into_val(&env);
         let data: Val = id.into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    // Issue #253: treasury had no set_admin at all before this change, so
+    // the Admin key (gating pause/set_compliance) could never be rotated.
+    #[test]
+    fn set_admin_event_records_outgoing_and_incoming_admin() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{vec, IntoVal, Val};
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _signers, _token) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
+        let data: Val = new_admin.clone().into_val(&env);
+        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    #[test]
+    fn set_admin_rejects_a_current_admin_that_does_not_match() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _signers, _token) = setup(&env);
+        let impostor = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        let res = client.try_set_admin(&impostor, &new_admin);
+        assert_eq!(res, Err(Ok(TreasuryError::Unauthorized)));
+    }
+
+    #[test]
+    fn set_admin_rotation_takes_effect_for_pause() {
+        // The new admin, not the old one, must be able to exercise the
+        // Admin-gated functions after rotation -- and the old one must not.
+        use soroban_sdk::IntoVal;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _signers, _token) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        // The old admin's signature no longer authorizes pause: simulate
+        // this explicitly rather than relying on mock_all_auths, which
+        // would let either address "sign" for anything.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_pause().is_err());
+
+        env.mock_all_auths();
+        client.pause();
+        assert!(client.is_paused());
     }
 }
 
