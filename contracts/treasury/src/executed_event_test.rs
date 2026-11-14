@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
     token::{StellarAssetClient, TokenClient},
-    Address, Env, IntoVal, Symbol, Val, Vec,
+    Address, Env, Event as _, Vec,
 };
 
 fn setup() -> (Env, TreasuryContractClient<'static>, Address, Address, Address, Address) {
@@ -49,11 +49,10 @@ fn executed_event_carries_amount_and_merchant() {
     //
     // The `executed` event's topic carries the merchant and its data carries
     // the settlement id and the paid amount.
-    let topics: Vec<Val> = (Symbol::new(&env, "executed"), merchant.clone()).into_val(&env);
-    let data: Val = (id, amount).into_val(&env);
+    let expected = SettlementExecutedEvent { merchant: merchant.clone(), settlement_id: id, amount };
     assert_eq!(
         env.events().all().filter_by_contract(&client.address),
-        soroban_sdk::vec![&env, (client.address.clone(), topics, data)]
+        [expected.to_xdr(&env, &client.address)]
     );
 
     // The merchant actually received the funds.
