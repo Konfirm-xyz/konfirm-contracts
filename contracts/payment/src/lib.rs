@@ -1,7 +1,7 @@
 #![no_std]
 
 use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
-use soroban_sdk::{contract, contractclient, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env};
 
 // This contract is an attestation layer, not an escrow. Funds for a checkout
 // payment move directly payer -> merchant muxed address via a classic
@@ -60,13 +60,40 @@ pub struct PaymentRecordedEvent {
 #[contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaymentRefundedEvent {
+    #[topic]
+    pub admin: Address,
     pub payment_id: u64,
+    pub amount: i128,
 }
 
 #[contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaymentVoidedEvent {
+    #[topic]
+    pub admin: Address,
     pub payment_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComplianceSetEvent {
+    pub compliance: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminRotatedEvent {
+    #[topic]
+    pub current_admin: Address,
+    pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpausedEvent {
+    #[topic]
+    pub admin: Address,
 }
 
 #[contracttype]
@@ -124,11 +151,10 @@ impl PaymentContract {
     /// Admin-only. Points this contract at the compliance contract consulted
     /// by `record_payment`. Fails with `NotInitialized` before `initialize`.
     pub fn set_compliance(env: Env, compliance: Address) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Compliance, &compliance);
-        // "compliance" is 10 chars, over Soroban's 9-char symbol_short cap;
-        // "complset" ("compliance set") keeps the intent within the limit.
-        env.events().publish((symbol_short!("complset"),), compliance);
+        ComplianceSetEvent { compliance }.publish(&env);
         Ok(())
     }
 
@@ -253,7 +279,7 @@ impl PaymentContract {
         }
         env.storage().persistent().set(&DataKey::Refunded(payment_id), &true);
         env.storage().persistent().extend_ttl(&DataKey::Refunded(payment_id), TTL_THRESHOLD, TTL_EXTEND_TO);
-        env.events().publish((symbol_short!("refunded"), admin), (payment_id, record.amount));
+        PaymentRefundedEvent { admin, payment_id, amount: record.amount }.publish(&env);
         Ok(())
     }
 
@@ -263,6 +289,7 @@ impl PaymentContract {
     /// `is_voided` before trusting it. Fails with `NotFound`, `AlreadyVoided`,
     /// `AlreadyRefunded`, or `Paused` while paused.
     pub fn void_payment(env: Env, payment_id: u64) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin = Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
         let record: PaymentRecord = env
@@ -277,7 +304,8 @@ impl PaymentContract {
             return Err(PaymentError::AlreadyRefunded);
         }
         env.storage().persistent().set(&DataKey::Voided(payment_id), &true);
-        env.events().publish((symbol_short!("voided"), admin), (payment_id, record.amount));
+        env.storage().persistent().extend_ttl(&DataKey::Voided(payment_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        PaymentVoidedEvent { admin, payment_id, amount: record.amount }.publish(&env);
         Ok(())
     }
 
@@ -320,6 +348,7 @@ impl PaymentContract {
     /// (treasury's 2-of-3 model) or a multisig deployer account is what closes
     /// that gap; see docs/KEYS.md.
     pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin: Address = env
             .storage()
             .instance()
@@ -331,7 +360,7 @@ impl PaymentContract {
         current_admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
+        AdminRotatedEvent { current_admin, new_admin }.publish(&env);
         Ok(())
     }
 
@@ -346,9 +375,10 @@ impl PaymentContract {
 
     /// Admin-only. Lifts a pause set by `pause`. Callable while paused.
     pub fn unpause(env: Env) -> Result<(), PaymentError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         let admin = Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((symbol_short!("unpaused"), admin), ());
+        UnpausedEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -361,7 +391,7 @@ impl PaymentContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
 
     fn setup(env: &Env) -> (PaymentContractClient<'_>, Address) {
@@ -387,6 +417,34 @@ mod test {
         assert_eq!(rec.link_id, 42u64);
         assert_eq!(rec.amount, 1_000_0000i128);
         assert!(!rec.refunded);
+    }
+
+    // issue #163's DuplicateTxHash rejection had no test exercising it while
+    // the contract is unpaused (issue #258) — every prior test either used a
+    // fresh hash per call or only touched the paused-state path, so the
+    // actual dedupe check in record_payment's normal, unpaused path had zero
+    // coverage.
+    #[test]
+    fn duplicate_tx_hash_rejected_while_unpaused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let merchant = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        assert!(!client.is_paused());
+        let id = client.record_payment(&merchant, &payer, &1u64, &100_0000i128, &tx_hash);
+
+        // Same tx_hash, different link/amount — must still be rejected: the
+        // dedupe key is the hash alone, not the rest of the payload.
+        let res = client.try_record_payment(&merchant, &payer, &2u64, &200_0000i128, &tx_hash);
+        assert_eq!(res, Err(Ok(PaymentError::DuplicateTxHash)));
+
+        // The original record is untouched by the rejected second call.
+        let rec = client.get_payment(&id);
+        assert_eq!(rec.link_id, 1u64);
+        assert_eq!(rec.amount, 100_0000i128);
     }
 
     #[test]
@@ -473,7 +531,7 @@ mod test {
     #[test]
     fn set_admin_event_records_outgoing_and_incoming_admin() {
         use soroban_sdk::testutils::Events as _;
-        use soroban_sdk::{vec, IntoVal, Val};
+        use soroban_sdk::Event as _;
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -481,13 +539,14 @@ mod test {
 
         client.set_admin(&admin, &new_admin);
 
-        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
-        let data: Val = new_admin.clone().into_val(&env);
-        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+        let expected = AdminRotatedEvent { current_admin: admin.clone(), new_admin: new_admin.clone() };
+        assert_eq!(env.events().all(), [expected.to_xdr(&env, &client.address)]);
     }
 
     #[test]
     fn refunded_and_voided_events_carry_admin_and_amount() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::Event as _;
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -503,28 +562,24 @@ mod test {
         let id2 = client.record_payment(&merchant, &payer, &2u64, &250_0000i128, &tx_hash2);
 
         client.mark_refunded(&id1);
+        let expected_refunded = PaymentRefundedEvent {
+            admin: new_admin.clone(),
+            payment_id: id1,
+            amount: 100_0000i128,
+        };
         assert_eq!(
             env.events().all().filter_by_contract(&client.address),
-            soroban_sdk::vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("refunded"), new_admin.clone()).into_val(&env),
-                    (id1, 100_0000i128).into_val(&env)
-                )
-            ]
+            [expected_refunded.to_xdr(&env, &client.address)]
         );
         client.void_payment(&id2);
+        let expected_voided = PaymentVoidedEvent {
+            admin: new_admin,
+            payment_id: id2,
+            amount: 250_0000i128,
+        };
         assert_eq!(
             env.events().all().filter_by_contract(&client.address),
-            soroban_sdk::vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("voided"), new_admin).into_val(&env),
-                    (id2, 250_0000i128).into_val(&env)
-                )
-            ]
+            [expected_voided.to_xdr(&env, &client.address)]
         );
     }
 }
