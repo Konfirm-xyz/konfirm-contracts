@@ -1091,6 +1091,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "konfirm-common",
+ "konfirm-compliance",
  "proptest",
  "soroban-sdk",
 ]
@@ -1115,6 +1116,7 @@ name = "konfirm-payment"
 version = "0.1.0"
 dependencies = [
  "konfirm-common",
+ "konfirm-compliance",
  "soroban-sdk",
 ]
 
@@ -1123,6 +1125,7 @@ name = "konfirm-treasury"
 version = "0.1.0"
 dependencies = [
  "konfirm-common",
+ "konfirm-compliance",
  "proptest",
  "soroban-sdk",
 ]

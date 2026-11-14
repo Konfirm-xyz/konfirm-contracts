@@ -42,7 +42,13 @@ All four contracts are **immutable by design**: none exposes `update_current_con
 
 Default-allow: an address is permitted unless explicitly blocked. `clear_address` restores the default rather than leaving an explicit "allowed" entry.
 
-**Advisory, not enforced on-chain.** `compliance` is consulted off-chain by `konfirm-backend` (`isAllowedOnChain`) before it calls `payment::record_payment` or proposes a `treasury` settlement. The `payment`, `treasury`, and `channel` contracts never call `compliance`, so a blocked address is not rejected by them. Treat `compliance` as the screening source of truth for the backend, not as a hard on-chain gate. Wiring it in as a gate would mean passing the compliance contract ID into `payment` and `treasury` at initialization and checking `is_allowed` in `record_payment`, `propose_settlement`, and `execute_settlement`.
+**Advisory by default; enforced on-chain once configured, for `payment`, `treasury`, and `channel` alike.** `compliance` is also consulted off-chain by `konfirm-backend` (`isAllowedOnChain`) before it calls `payment::record_payment` or proposes a `treasury` settlement. But `payment`, `treasury`, and `channel` each additionally have their own admin-only `set_compliance(compliance: Address)`, pointing them at a `compliance` deployment. Once set, each contract calls `is_allowed` on-chain before it moves or commits funds, and rejects with `ComplianceBlocked` if the configured contract reports an address blocked:
+
+- `payment::record_payment` checks both `merchant` and `payer`.
+- `treasury::propose_settlement` and `execute_settlement` each check the settlement's `merchant` (two independent checks — a merchant cleared at proposal time can still be blocked by execution time).
+- `channel::open_channel` and `top_up` each check both the channel's `payer` and `payee` — the two points where new exposure is created. `checkpoint` and `finalize_close` are deliberately **not** gated: like `pause`, compliance enforcement only blocks new exposure, never a withdrawal someone can already prove is owed to them.
+
+Before `set_compliance` is called, a contract's compliance check is a no-op (advisory-only), so existing deployments keep working unchanged until the admin opts in. Treat `compliance` as the screening source of truth for the backend either way.
 
 ### `payment`
 
@@ -52,6 +58,7 @@ Default-allow: an address is permitted unless explicitly blocked. `clear_address
 | `record_payment` | see `lib.rs` — writes a payment record |
 | `mark_refunded` | `(payment_id: u64)` — rejects a second refund on the same ID |
 | `get_payment` | `(payment_id: u64) -> PaymentRecord` |
+| `set_compliance` | `(compliance: Address)` — admin-only; `record_payment` checks both `merchant` and `payer` against it once set |
 | `set_admin` | `(current_admin: Address, new_admin: Address)` — both must authorize; not pause-gated |
 | `pause` / `unpause` | `()` |
 
@@ -60,6 +67,7 @@ Default-allow: an address is permitted unless explicitly blocked. `clear_address
 | Function | Signature |
 |---|---|
 | `initialize` | signer set + threshold |
+| `set_compliance` | `(compliance: Address)` — admin-only; `propose_settlement`/`execute_settlement` each independently check the merchant against it once set |
 | `propose_settlement` | creates a pending settlement |
 | `approve_settlement` | `(signer: Address, settlement_id: u64)` — rejects non-signers and double-approval |
 | `execute_settlement` | `(caller: Address, settlement_id: u64)` — caller must be a signer; only once threshold is met; rejects double-execution |
@@ -81,6 +89,7 @@ Deployed with a 2-of-3 threshold (see [Deployed addresses](#deployed-addresses-t
 | `initiate_close` / `finalize_close` | unilateral close, respecting the challenge period; refunds the remainder once it elapses |
 | `hold_channel` / `release_hold` | freezes/unfreezes checkpointing without closing |
 | `get_channel_info` | `(channel_id: u64) -> Channel` |
+| `set_compliance` | `(compliance: Address)` — admin-only; `open_channel`/`top_up` each check both `payer` and `payee` against it once set |
 | `set_admin` | `(current_admin: Address, new_admin: Address)` — both must authorize; not pause-gated |
 | `pause` / `unpause` | `()` |
 

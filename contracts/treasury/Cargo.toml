@@ -16,6 +16,10 @@ soroban-sdk = "=27.0.5"
 [dev-dependencies]
 soroban-sdk = { version = "=27.0.5", features = ["testutils"] }
 proptest = "1"
+# Needed only to register ComplianceContract alongside TreasuryContract in a
+# same-Env integration test (issue #254). treasury calls compliance by
+# runtime Address, not a Cargo dependency, so this is test-only.
+konfirm-compliance = { path = "../compliance" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

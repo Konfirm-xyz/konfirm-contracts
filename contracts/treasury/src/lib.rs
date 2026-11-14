@@ -563,3 +563,6 @@ mod test {
 
 #[cfg(test)]
 mod executed_event_test;
+
+#[cfg(test)]
+mod compliance_integration_test;
