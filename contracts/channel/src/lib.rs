@@ -64,6 +64,11 @@ enum DataKey {
     NextId,
     Channel(u64),
     HeldFrom(u64),
+    // Ledger timestamp at which hold_channel most recently placed this
+    // channel on hold. Only meaningful (and only ever set) alongside a
+    // HeldFrom entry; read back by release_hold to pause the challenge-
+    // period clock for exactly the hold's duration (issue #261).
+    HeldAt(u64),
     AllowedToken(Address),
     OpenCount(Address),
 }
@@ -353,6 +358,13 @@ impl ChannelContract {
     /// Only Open or Closing channels can be held. Closing is included so an
     /// admin can freeze a suspect exit; release_hold restores whichever of the
     /// two it was in, so a unilateral exit is never silently reopened.
+    ///
+    /// Issue #261: holding a `Closing` channel also pauses its
+    /// challenge-period clock for the duration of the hold (see
+    /// `release_hold`) — `checkpoint` is unconditionally blocked while
+    /// `Held`, which is the payee's only mechanism to dispute a close, so a
+    /// hold that didn't pause the clock could silently consume the payee's
+    /// entire dispute window.
     pub fn hold_channel(env: Env, channel_id: u64) -> Result<(), ChannelError> {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
@@ -361,12 +373,27 @@ impl ChannelContract {
             return Err(ChannelError::NotOpen);
         }
         env.storage().persistent().set(&DataKey::HeldFrom(channel_id), &ch.status);
+        env.storage().persistent().set(&DataKey::HeldAt(channel_id), &env.ledger().timestamp());
         ch.status = ChannelStatus::Held;
         Self::save_channel(&env, channel_id, &ch);
         env.events().publish((symbol_short!("held"),), channel_id);
         Ok(())
     }
 
+    /// Restores whichever of `Open`/`Closing` the channel was held from.
+    ///
+    /// Issue #261: if the channel was held from `Closing`, `closing_at` is
+    /// shifted forward by exactly the duration it spent `Held`
+    /// (`now - held_at`) before being restored — so the challenge-period
+    /// deadline (`closing_at + period`, checked by `finalize_close`) moves
+    /// out by the same amount. This resumes the payee's remaining dispute
+    /// window from exactly where it was at the moment of the hold, rather
+    /// than restarting it (which would hand out extra time not agreed to by
+    /// either party) or leaving it unmodified (which is the bug this issue
+    /// fixes: a hold held long enough would otherwise leave zero window, or
+    /// even let `finalize_close` succeed immediately on release). A hold
+    /// placed on an `Open` channel has no `closing_at` yet to adjust —
+    /// `initiate_close` sets it fresh whenever it is eventually called.
     pub fn release_hold(env: Env, channel_id: u64) -> Result<(), ChannelError> {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
@@ -379,7 +406,17 @@ impl ChannelContract {
             .persistent()
             .get(&DataKey::HeldFrom(channel_id))
             .ok_or(ChannelError::NotOpen)?;
+        let held_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HeldAt(channel_id))
+            .ok_or(ChannelError::NotOpen)?;
         env.storage().persistent().remove(&DataKey::HeldFrom(channel_id));
+        env.storage().persistent().remove(&DataKey::HeldAt(channel_id));
+        if prior == ChannelStatus::Closing {
+            let held_duration = env.ledger().timestamp().saturating_sub(held_at);
+            ch.closing_at = ch.closing_at.saturating_add(held_duration);
+        }
         ch.status = prior;
         Self::save_channel(&env, channel_id, &ch);
         env.events().publish((symbol_short!("release"),), channel_id);
@@ -987,6 +1024,135 @@ mod test {
         client.initiate_close(&payer, &id);
         assert_eq!(client.try_release_hold(&id), Err(Ok(ChannelError::NotOpen)));
         assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Closing);
+    }
+
+    // Issue #261: a hold placed on a Closing channel must pause the
+    // challenge-period clock for exactly the hold's duration, not let it
+    // keep running (which would let the hold silently consume the payee's
+    // entire dispute window) and not restart it either (which would hand
+    // out extra time nobody agreed to).
+    #[test]
+    fn hold_during_closing_pauses_the_challenge_clock_and_release_resumes_it() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        let period: u64 = 3_600;
+        client.initialize(&admin, &period);
+        client.set_token_allowed(&token_id, &true);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let payer_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128, &None);
+        let sign_claim = |nonce: u64, amount: i128| -> BytesN<64> {
+            let payload = ChannelContract::claim_payload(&env, &contract_id, id, nonce, amount);
+            BytesN::from_array(&env, &signing_key.sign(&payload_bytes(&payload)).to_bytes())
+        };
+
+        client.initiate_close(&payer, &id);
+        let closing_at_original = client.get_channel_info(&id).closing_at;
+
+        // 1000s into the 3600s challenge period -- 2600s of the window
+        // remain -- the admin places a hold.
+        env.ledger().with_mut(|l| l.timestamp += 1_000);
+        client.hold_channel(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Held);
+
+        // Hold the channel for 3000s: past where the *original* challenge
+        // period (closing_at_original + 3600) would have expired.
+        env.ledger().with_mut(|l| l.timestamp += 3_000);
+        assert!(env.ledger().timestamp() > closing_at_original + period);
+
+        // While Held, checkpoint (the payee's only dispute mechanism) is
+        // blocked and finalize_close cannot run at all (status isn't
+        // Closing) -- the channel must not have auto-finalized.
+        let res = client.try_checkpoint(&id, &100_0000i128, &1u64, &sign_claim(1, 100_0000));
+        assert_eq!(res, Err(Ok(ChannelError::Held)));
+        let res = client.try_finalize_close(&id);
+        assert_eq!(res, Err(Ok(ChannelError::NotClosing)));
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Held);
+
+        // Release: status returns to Closing, and closing_at must have
+        // shifted forward by exactly the 3000s the hold lasted.
+        client.release_hold(&id);
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.status, ChannelStatus::Closing);
+        assert_eq!(ch.closing_at, closing_at_original + 3_000);
+
+        // The payee's remaining dispute window at the moment of the hold
+        // was 2600s (3600 - 1000). That must still be available now, not
+        // zero and not the full original 3600s again.
+        let res = client.try_finalize_close(&id);
+        assert_eq!(res, Err(Ok(ChannelError::ChallengeNotElapsed)));
+
+        // The payee can still dispute with a fresh, higher-nonce checkpoint
+        // inside the resumed window -- proving the window is not just
+        // numerically preserved but actually usable.
+        client.checkpoint(&id, &300_0000i128, &2u64, &sign_claim(2, 300_0000));
+        assert_eq!(client.get_channel_info(&id).claimed, 300_0000i128);
+
+        // 2599s further (one short of the resumed 2600s remaining) still fails.
+        env.ledger().with_mut(|l| l.timestamp += 2_599);
+        assert_eq!(client.try_finalize_close(&id), Err(Ok(ChannelError::ChallengeNotElapsed)));
+
+        // The final second lands exactly on the resumed boundary and succeeds.
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        client.finalize_close(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Closed);
+
+        let token_client = token::TokenClient::new(&env, &token_id);
+        assert_eq!(token_client.balance(&payee), 300_0000i128);
+        assert_eq!(token_client.balance(&payer), 1_000_0000i128 - 300_0000i128);
+    }
+
+    // A hold placed on an Open channel (no closing_at yet) must not be
+    // affected by the #261 fix -- initiate_close, called after release,
+    // still gets a fresh full challenge period.
+    #[test]
+    fn hold_during_open_does_not_affect_a_later_initiate_close() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        let period: u64 = 3_600;
+        client.initialize(&admin, &period);
+        client.set_token_allowed(&token_id, &true);
+        let payer_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &500_0000i128, &None);
+
+        client.hold_channel(&id);
+        env.ledger().with_mut(|l| l.timestamp += 10_000);
+        client.release_hold(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Open);
+
+        let now = env.ledger().timestamp();
+        client.initiate_close(&payer, &id);
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.closing_at, now, "closing_at must be set fresh at initiate_close, unaffected by the earlier Open-state hold");
+
+        let res = client.try_finalize_close(&id);
+        assert_eq!(res, Err(Ok(ChannelError::ChallengeNotElapsed)));
+        env.ledger().with_mut(|l| l.timestamp += period);
+        client.finalize_close(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Closed);
     }
 
     // Every other initiate_close call site uses the payer, so the payee half
