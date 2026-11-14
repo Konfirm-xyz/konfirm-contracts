@@ -81,6 +81,8 @@ Deployed with a 2-of-3 threshold (see [Deployed addresses](#deployed-addresses-t
 | `initiate_close` / `finalize_close` | unilateral close, respecting the challenge period; refunds the remainder once it elapses |
 | `hold_channel` / `release_hold` | freezes/unfreezes checkpointing without closing |
 | `get_channel_info` | `(channel_id: u64) -> Channel` |
+
+**Holding a `Closing` channel pauses its challenge-period clock.** `checkpoint` is the payee's only mechanism to dispute a close, and it's unconditionally blocked while `Held`. `release_hold` shifts `closing_at` forward by exactly the duration the channel spent held, so the payee's remaining dispute window at the moment of the hold is resumed, not shortened (a hold that didn't do this could otherwise be used, deliberately or not, to consume the payee's entire challenge period). A hold placed on an `Open` channel has no `closing_at` yet and is unaffected; `initiate_close` sets it fresh whenever it's eventually called.
 | `set_admin` | `(current_admin: Address, new_admin: Address)` — both must authorize; not pause-gated |
 | `pause` / `unpause` | `()` |
 
