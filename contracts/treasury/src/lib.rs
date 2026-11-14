@@ -51,6 +51,11 @@ enum DataKey {
     NextId,
     Settlement(u64),
     Compliance,
+    // Running total of `amount` across every still-`Pending` settlement,
+    // maintained incrementally (issue #259) rather than recomputed by
+    // scanning every settlement ever created. Mirrors how `channel`
+    // maintains `OpenCount` incrementally instead of scanning every channel.
+    TotalPendingCommitted,
 }
 
 #[contracterror]
@@ -121,6 +126,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::NextId, &1u64);
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &0i128);
         env.events().publish((symbol_short!("init"),), admin);
         Ok(())
     }
@@ -200,23 +206,34 @@ impl TreasuryContract {
     // Sum of `amount` across every still-`Pending` settlement. These have
     // first claim on the treasury balance ahead of any newly-approved
     // settlement, so signers should treat this as committed funds.
+    //
+    // Issue #259: this used to be an O(n) scan over every settlement id ever
+    // issued, re-reading each one from persistent storage on every call --
+    // unbounded, since no settlement is ever removed from storage (even
+    // `sweep_expired_settlement` only flips its status). It is now an O(1)
+    // read of a running total maintained incrementally by
+    // `add_pending_committed`/`remove_pending_committed`, the same pattern
+    // `channel::OpenCount` already uses instead of scanning every channel
+    // (the fix this issue is explicitly modeled on).
     fn pending_committed(env: &Env) -> i128 {
-        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-        let mut total: i128 = 0;
-        let mut id: u64 = 1;
-        while id < next_id {
-            if let Some(settlement) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Settlement>(&DataKey::Settlement(id))
-            {
-                if settlement.status == SettlementStatus::Pending {
-                    total += settlement.amount;
-                }
-            }
-            id += 1;
-        }
-        total
+        env.storage().instance().get(&DataKey::TotalPendingCommitted).unwrap_or(0)
+    }
+
+    // Must be called exactly once, when a settlement enters `Pending`
+    // (`propose_settlement`).
+    fn add_pending_committed(env: &Env, amount: i128) {
+        let total = Self::pending_committed(env) + amount;
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &total);
+    }
+
+    // Must be called exactly once, when a settlement leaves `Pending` for a
+    // terminal status (`execute_settlement` -> `Executed`,
+    // `sweep_expired_settlement` -> `Cancelled`). `approve_settlement` does
+    // NOT call this: approving does not change `status` or `amount`, so the
+    // running total is unaffected.
+    fn remove_pending_committed(env: &Env, amount: i128) {
+        let total = Self::pending_committed(env) - amount;
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &total);
     }
 
     /// Signer-only, pause-gated. Opens a new `Pending` settlement paying
@@ -257,6 +274,7 @@ impl TreasuryContract {
             proposed_at: env.ledger().timestamp(),
         };
         Self::save_settlement(&env, id, &settlement);
+        Self::add_pending_committed(&env, amount);
         env.events().publish((symbol_short!("proposed"), merchant), (id, amount));
         Ok(id)
     }
@@ -383,6 +401,12 @@ impl TreasuryContract {
         let merchant = settlement.merchant.clone();
         let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        // Leaves Pending for a terminal status -- remove its claim on the
+        // running total (issue #259). Safe even though the transfer above
+        // already happened: if the transfer had trapped, the whole
+        // invocation (including this decrement) reverts atomically, same as
+        // the settlement-stays-Pending guarantee this function already has.
+        Self::remove_pending_committed(&env, amount);
         // Carries the merchant and amount, not just the id (issue #76): a
         // listener otherwise has to look the settlement back up to know what
         // was actually paid out.
@@ -421,7 +445,11 @@ impl TreasuryContract {
         }
 
         settlement.status = SettlementStatus::Cancelled;
+        let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        // Leaves Pending for a terminal status -- remove its claim on the
+        // running total (issue #259), same as execute_settlement.
+        Self::remove_pending_committed(&env, amount);
         env.events().publish((symbol_short!("expired"),), settlement_id);
         Ok(())
     }
@@ -563,3 +591,6 @@ mod test {
 
 #[cfg(test)]
 mod executed_event_test;
+
+#[cfg(test)]
+mod pending_committed_lifecycle_test;
