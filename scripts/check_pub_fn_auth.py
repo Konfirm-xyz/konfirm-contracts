@@ -22,8 +22,13 @@ PERMISSIONLESS = re.compile(r"^\s*///\s*Permissionless\b")
 CONTRACT_ID = re.compile(r"\bC[A-Z2-7]{55}\b")
 # Files that legitimately hold the canonical address list or are not tracked
 # sources of truth (README is the source; artifacts/ is gitignored/local-only).
+# test_snapshots/ holds soroban-sdk testutils' committed ledger-snapshot
+# fixtures, which embed synthetic, deterministically-sequential contract IDs
+# (56-char strkeys of mostly repeated "A"s) assigned by the in-memory test Env
+# to every contract `env.register()`s in a test run -- never a real deployed
+# address, so they must not be checked against README's table.
 ADDRESS_SCAN_SKIP = {"README.md"}
-ADDRESS_SCAN_SKIP_DIRS = {".git", "target", "node_modules", "artifacts"}
+ADDRESS_SCAN_SKIP_DIRS = {".git", "target", "node_modules", "artifacts", "test_snapshots"}
 
 
 def is_permissionless(lines, index):
@@ -55,7 +60,11 @@ def readme_addresses():
     if not readme.exists():
         return None
     text = readme.read_text()
-    marker = re.search(r"^#+\s*Deployed Addresses\s*$", text, re.MULTILINE)
+    # Case-insensitive and tolerant of trailing text on the heading line
+    # (e.g. "## Deployed addresses (Testnet)") -- the exact casing and
+    # suffix have drifted at least once already (M1 redeploy) without this
+    # check being updated, which silently broke this entire function.
+    marker = re.search(r"^#+\s*Deployed Addresses\b.*$", text, re.MULTILINE | re.IGNORECASE)
     if not marker:
         return None
     section = text[marker.end():]

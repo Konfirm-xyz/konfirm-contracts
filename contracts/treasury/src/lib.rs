@@ -51,6 +51,11 @@ enum DataKey {
     NextId,
     Settlement(u64),
     Compliance,
+    // Running total of `amount` across every still-`Pending` settlement,
+    // maintained incrementally (issue #259) rather than recomputed by
+    // scanning every settlement ever created. Mirrors how `channel`
+    // maintains `OpenCount` incrementally instead of scanning every channel.
+    TotalPendingCommitted,
 }
 
 #[contracterror]
@@ -59,7 +64,9 @@ enum DataKey {
 pub enum TreasuryError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
-    /// Never returned: admin/signer gates use `require_auth()`, which traps at the host before this can be produced. Code 3 stays reserved for ABI stability.
+    /// Returned by `set_admin` when `current_admin` does not match the
+    /// stored admin. Other admin/signer gates use `require_auth()`, which
+    /// traps at the host before this can be produced.
     Unauthorized = 3,
     Paused = 4,
     NotFound = 5,
@@ -121,6 +128,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::NextId, &1u64);
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &0i128);
         env.events().publish((symbol_short!("init"),), admin);
         Ok(())
     }
@@ -200,23 +208,34 @@ impl TreasuryContract {
     // Sum of `amount` across every still-`Pending` settlement. These have
     // first claim on the treasury balance ahead of any newly-approved
     // settlement, so signers should treat this as committed funds.
+    //
+    // Issue #259: this used to be an O(n) scan over every settlement id ever
+    // issued, re-reading each one from persistent storage on every call --
+    // unbounded, since no settlement is ever removed from storage (even
+    // `sweep_expired_settlement` only flips its status). It is now an O(1)
+    // read of a running total maintained incrementally by
+    // `add_pending_committed`/`remove_pending_committed`, the same pattern
+    // `channel::OpenCount` already uses instead of scanning every channel
+    // (the fix this issue is explicitly modeled on).
     fn pending_committed(env: &Env) -> i128 {
-        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-        let mut total: i128 = 0;
-        let mut id: u64 = 1;
-        while id < next_id {
-            if let Some(settlement) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Settlement>(&DataKey::Settlement(id))
-            {
-                if settlement.status == SettlementStatus::Pending {
-                    total += settlement.amount;
-                }
-            }
-            id += 1;
-        }
-        total
+        env.storage().instance().get(&DataKey::TotalPendingCommitted).unwrap_or(0)
+    }
+
+    // Must be called exactly once, when a settlement enters `Pending`
+    // (`propose_settlement`).
+    fn add_pending_committed(env: &Env, amount: i128) {
+        let total = Self::pending_committed(env) + amount;
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &total);
+    }
+
+    // Must be called exactly once, when a settlement leaves `Pending` for a
+    // terminal status (`execute_settlement` -> `Executed`,
+    // `sweep_expired_settlement` -> `Cancelled`). `approve_settlement` does
+    // NOT call this: approving does not change `status` or `amount`, so the
+    // running total is unaffected.
+    fn remove_pending_committed(env: &Env, amount: i128) {
+        let total = Self::pending_committed(env) - amount;
+        env.storage().instance().set(&DataKey::TotalPendingCommitted, &total);
     }
 
     /// Signer-only, pause-gated. Opens a new `Pending` settlement paying
@@ -257,6 +276,7 @@ impl TreasuryContract {
             proposed_at: env.ledger().timestamp(),
         };
         Self::save_settlement(&env, id, &settlement);
+        Self::add_pending_committed(&env, amount);
         env.events().publish((symbol_short!("proposed"), merchant), (id, amount));
         Ok(id)
     }
@@ -383,6 +403,12 @@ impl TreasuryContract {
         let merchant = settlement.merchant.clone();
         let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        // Leaves Pending for a terminal status -- remove its claim on the
+        // running total (issue #259). Safe even though the transfer above
+        // already happened: if the transfer had trapped, the whole
+        // invocation (including this decrement) reverts atomically, same as
+        // the settlement-stays-Pending guarantee this function already has.
+        Self::remove_pending_committed(&env, amount);
         // Carries the merchant and amount, not just the id (issue #76): a
         // listener otherwise has to look the settlement back up to know what
         // was actually paid out.
@@ -421,8 +447,48 @@ impl TreasuryContract {
         }
 
         settlement.status = SettlementStatus::Cancelled;
+        let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        // Leaves Pending for a terminal status -- remove its claim on the
+        // running total (issue #259), same as execute_settlement.
+        Self::remove_pending_committed(&env, amount);
         env.events().publish((symbol_short!("expired"),), settlement_id);
+        Ok(())
+    }
+
+    /// Rotates the admin key. Requires auth from both the current admin and
+    /// the incoming one, so a handoff can't strand the contract on an
+    /// address nobody holds. Deliberately not pause-gated: rotating away
+    /// from a suspected key must still work during an incident. Mirrors
+    /// `compliance::set_admin` / `payment::set_admin` / `channel::set_admin`
+    /// exactly (issue #253 — treasury was the one contract of the four
+    /// missing this).
+    ///
+    /// This governs only the single `Admin` key that gates `pause`,
+    /// `unpause`, and `set_compliance` — it has no effect on the
+    /// `Signers`/`Threshold` multisig that gates settlement
+    /// proposal/approval/execution, which is fixed at `initialize` and out
+    /// of scope here (tracked separately in #169).
+    ///
+    /// This does NOT defend against a leaked current admin key on its own —
+    /// that key can still rotate to an attacker-held address. This
+    /// contract's own signer quorum does not gate the Admin key itself; a
+    /// multisig deployer/admin account is what would close that gap; see
+    /// docs/KEYS.md.
+    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if current_admin != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+        current_admin.require_auth();
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
         Ok(())
     }
 
@@ -559,7 +625,71 @@ mod test {
         let data: Val = id.into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
     }
+
+    // Issue #253: treasury had no set_admin at all before this change, so
+    // the Admin key (gating pause/set_compliance) could never be rotated.
+    #[test]
+    fn set_admin_event_records_outgoing_and_incoming_admin() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{vec, IntoVal, Val};
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _signers, _token) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
+        let data: Val = new_admin.clone().into_val(&env);
+        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    #[test]
+    fn set_admin_rejects_a_current_admin_that_does_not_match() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _signers, _token) = setup(&env);
+        let impostor = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        let res = client.try_set_admin(&impostor, &new_admin);
+        assert_eq!(res, Err(Ok(TreasuryError::Unauthorized)));
+    }
+
+    #[test]
+    fn set_admin_rotation_takes_effect_for_pause() {
+        // The new admin, not the old one, must be able to exercise the
+        // Admin-gated functions after rotation -- and the old one must not.
+        use soroban_sdk::IntoVal;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _signers, _token) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        // The old admin's signature no longer authorizes pause: simulate
+        // this explicitly rather than relying on mock_all_auths, which
+        // would let either address "sign" for anything.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_pause().is_err());
+
+        env.mock_all_auths();
+        client.pause();
+        assert!(client.is_paused());
+    }
 }
 
 #[cfg(test)]
 mod executed_event_test;
+
+#[cfg(test)]
+mod pending_committed_lifecycle_test;
