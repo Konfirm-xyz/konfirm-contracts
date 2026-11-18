@@ -51,6 +51,7 @@ enum DataKey {
     NextId,
     Settlement(u64),
     Compliance,
+    TotalPendingCommitted,
 }
 
 #[contracterror]
@@ -121,6 +122,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::NextId, &1u64);
+        Self::set_total_pending_committed(&env, 0);
         env.events().publish((symbol_short!("init"),), admin);
         Ok(())
     }
@@ -197,26 +199,24 @@ impl TreasuryContract {
         token::Client::new(env, &token).balance(&env.current_contract_address())
     }
 
-    // Sum of `amount` across every still-`Pending` settlement. These have
-    // first claim on the treasury balance ahead of any newly-approved
-    // settlement, so signers should treat this as committed funds.
+    fn get_total_pending_committed(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalPendingCommitted)
+            .unwrap_or(0)
+    }
+
+    fn set_total_pending_committed(env: &Env, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalPendingCommitted, &amount);
+    }
+
+    // Sum of `amount` across every still-`Pending` settlement. Maintained as
+    // an O(1) instance storage counter (`TotalPendingCommitted`) incremented on
+    // proposal and decremented on execution or expiration sweep.
     fn pending_committed(env: &Env) -> i128 {
-        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-        let mut total: i128 = 0;
-        let mut id: u64 = 1;
-        while id < next_id {
-            if let Some(settlement) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Settlement>(&DataKey::Settlement(id))
-            {
-                if settlement.status == SettlementStatus::Pending {
-                    total += settlement.amount;
-                }
-            }
-            id += 1;
-        }
-        total
+        Self::get_total_pending_committed(env)
     }
 
     /// Signer-only, pause-gated. Opens a new `Pending` settlement paying
@@ -257,6 +257,8 @@ impl TreasuryContract {
             proposed_at: env.ledger().timestamp(),
         };
         Self::save_settlement(&env, id, &settlement);
+        let current_pending = Self::get_total_pending_committed(&env);
+        Self::set_total_pending_committed(&env, current_pending.saturating_add(amount));
         env.events().publish((symbol_short!("proposed"), merchant), (id, amount));
         Ok(id)
     }
@@ -383,6 +385,8 @@ impl TreasuryContract {
         let merchant = settlement.merchant.clone();
         let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        let current_pending = Self::get_total_pending_committed(&env);
+        Self::set_total_pending_committed(&env, current_pending.saturating_sub(amount));
         // Carries the merchant and amount, not just the id (issue #76): a
         // listener otherwise has to look the settlement back up to know what
         // was actually paid out.
@@ -421,7 +425,10 @@ impl TreasuryContract {
         }
 
         settlement.status = SettlementStatus::Cancelled;
+        let amount = settlement.amount;
         Self::save_settlement(&env, settlement_id, &settlement);
+        let current_pending = Self::get_total_pending_committed(&env);
+        Self::set_total_pending_committed(&env, current_pending.saturating_sub(amount));
         env.events().publish((symbol_short!("expired"),), settlement_id);
         Ok(())
     }
@@ -558,6 +565,52 @@ mod test {
         let topics: soroban_sdk::Vec<Val> = (symbol_short!("approved"), approver.clone()).into_val(&env);
         let data: Val = id.into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+    }
+
+    #[test]
+    fn total_pending_committed_maintains_o1_counter_across_lifecycle() {
+        use soroban_sdk::testutils::Ledger as _;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, token_id) = setup(&env);
+        let token_client = token::TokenClient::new(&env, &token_id);
+        let initial_balance = token_client.balance(&client.address);
+
+        // 1. Initial state: pending committed must be exactly 0
+        assert_eq!(client.committed_balance(), 0);
+        assert_eq!(client.available_balance(), initial_balance);
+
+        let merchant_1 = Address::generate(&env);
+        let merchant_2 = Address::generate(&env);
+        let amount_1 = 20_000_0000i128;
+        let amount_2 = 30_000_0000i128;
+
+        // 2. Propose first settlement: committed increases by amount_1
+        let id_1 = client.propose_settlement(&signers.get(0).unwrap(), &merchant_1, &amount_1);
+        assert_eq!(client.committed_balance(), amount_1);
+        assert_eq!(client.available_balance(), initial_balance - amount_1);
+        assert!(client.is_settlement_payable(&id_1));
+
+        // 3. Propose second settlement: committed increases by amount_2
+        let id_2 = client.propose_settlement(&signers.get(1).unwrap(), &merchant_2, &amount_2);
+        assert_eq!(client.committed_balance(), amount_1 + amount_2);
+        assert_eq!(client.available_balance(), initial_balance - (amount_1 + amount_2));
+        assert!(client.is_settlement_payable(&id_2));
+
+        // 4. Approve and execute first settlement: committed decreases by amount_1
+        client.approve_settlement(&signers.get(1).unwrap(), &id_1);
+        client.execute_settlement(&signers.get(0).unwrap(), &id_1);
+        assert_eq!(client.committed_balance(), amount_2);
+        let new_token_balance = token_client.balance(&client.address);
+        assert_eq!(new_token_balance, initial_balance - amount_1);
+        assert_eq!(client.available_balance(), new_token_balance - amount_2);
+
+        // 5. Fast-forward past MAX_PENDING_LIFETIME and sweep second settlement
+        env.ledger().set_timestamp(env.ledger().timestamp() + MAX_PENDING_LIFETIME + 1);
+        client.sweep_expired_settlement(&id_2);
+        assert_eq!(client.committed_balance(), 0);
+        assert_eq!(client.available_balance(), new_token_balance);
+        assert_eq!(client.is_settlement_payable(&id_2), false);
     }
 }
 
