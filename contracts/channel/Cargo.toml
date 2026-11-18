@@ -14,6 +14,7 @@ konfirm-common = { path = "../common" }
 soroban-sdk = "=27.0.5"
 
 [dev-dependencies]
+soroban-sdk = { version = "=27.0.5", features = ["testutils"] }
 # Already present transitively (soroban-sdk's own testutils::sign module
 # depends on it) — declared directly here, pinned to the exact version
 # already resolved in Cargo.lock, so tests can sign raw claim_payload bytes
