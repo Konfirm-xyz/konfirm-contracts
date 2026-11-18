@@ -64,6 +64,7 @@ enum DataKey {
     NextId,
     Channel(u64),
     HeldFrom(u64),
+    HeldAt(u64),
     AllowedToken(Address),
     OpenCount(Address),
 }
@@ -352,7 +353,9 @@ impl ChannelContract {
 
     /// Only Open or Closing channels can be held. Closing is included so an
     /// admin can freeze a suspect exit; release_hold restores whichever of the
-    /// two it was in, so a unilateral exit is never silently reopened.
+    /// two it was in, so a unilateral exit is never silently reopened. When
+    /// holding a Closing channel, the challenge window is paused by tracking the
+    /// hold timestamp and extending closing_at upon release.
     pub fn hold_channel(env: Env, channel_id: u64) -> Result<(), ChannelError> {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
@@ -360,7 +363,11 @@ impl ChannelContract {
         if ch.status != ChannelStatus::Open && ch.status != ChannelStatus::Closing {
             return Err(ChannelError::NotOpen);
         }
+        let now = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::HeldFrom(channel_id), &ch.status);
+        env.storage().persistent().set(&DataKey::HeldAt(channel_id), &now);
+        env.storage().persistent().extend_ttl(&DataKey::HeldFrom(channel_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().extend_ttl(&DataKey::HeldAt(channel_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         ch.status = ChannelStatus::Held;
         Self::save_channel(&env, channel_id, &ch);
         env.events().publish((symbol_short!("held"),), channel_id);
@@ -379,7 +386,18 @@ impl ChannelContract {
             .persistent()
             .get(&DataKey::HeldFrom(channel_id))
             .ok_or(ChannelError::NotOpen)?;
+        let held_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HeldAt(channel_id))
+            .unwrap_or(0);
         env.storage().persistent().remove(&DataKey::HeldFrom(channel_id));
+        env.storage().persistent().remove(&DataKey::HeldAt(channel_id));
+        let now = env.ledger().timestamp();
+        if prior == ChannelStatus::Closing && held_at > 0 && now > held_at {
+            let held_duration = now.saturating_sub(held_at);
+            ch.closing_at = ch.closing_at.saturating_add(held_duration);
+        }
         ch.status = prior;
         Self::save_channel(&env, channel_id, &ch);
         env.events().publish((symbol_short!("release"),), channel_id);
@@ -1112,5 +1130,70 @@ mod test {
         let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
         let data: Val = new_admin.clone().into_val(&env);
         assert_eq!(env.events().all(), vec![&env, (contract_id, topics, data)]);
+    }
+
+    #[test]
+    fn release_hold_on_closing_channel_preserves_payee_dispute_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = setup_token(&env, &token_admin);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        token_admin_client.mint(&payer, &1_000_0000i128);
+
+        let contract_id = env.register(ChannelContract, ());
+        let client = ChannelContractClient::new(&env, &contract_id);
+        let challenge_period: u64 = 3_600;
+        client.initialize(&admin, &challenge_period);
+        client.set_token_allowed(&token_id, &true);
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let payer_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let deposit: i128 = 500_0000;
+        let id = client.open_channel(&payer, &payee, &token_id, &payer_pubkey, &deposit, &None);
+
+        // 1. Payer initiates unilateral exit
+        client.initiate_close(&payer, &id);
+        let initial_closing_at = client.get_channel_info(&id).closing_at;
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Closing);
+
+        // 2. 600s into the challenge window, admin places hold to investigate suspect exit
+        env.ledger().with_mut(|l| l.timestamp += 600);
+        client.hold_channel(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Held);
+
+        // 3. Channel remains held for 2,000s
+        env.ledger().with_mut(|l| l.timestamp += 2_000);
+
+        // 4. Admin releases hold
+        client.release_hold(&id);
+        let ch = client.get_channel_info(&id);
+        assert_eq!(ch.status, ChannelStatus::Closing);
+        // Dispute window must be extended by the 2,000s hold duration
+        assert_eq!(ch.closing_at, initial_closing_at + 2_000);
+
+        // 5. At initial_closing_at + challenge_period + 10s, finalize_close must STILL fail
+        env.ledger().with_mut(|l| l.timestamp = initial_closing_at + challenge_period + 10);
+        assert_eq!(
+            client.try_finalize_close(&id),
+            Err(Ok(ChannelError::ChallengeNotElapsed))
+        );
+
+        // 6. Payee can still submit a disputing checkpoint during this extended window
+        let nonce: u64 = 1;
+        let claim_amount: i128 = 200_0000;
+        let payload = ChannelContract::claim_payload(&env, &contract_id, id, nonce, claim_amount);
+        let signature = BytesN::from_array(&env, &signing_key.sign(&payload_bytes(&payload)).to_bytes());
+        client.checkpoint(&id, &claim_amount, &nonce, &signature);
+        assert_eq!(client.get_channel_info(&id).claimed, claim_amount);
+
+        // 7. Once extended period actually elapses (initial_closing_at + 2000 + challenge_period + 1), finalize succeeds
+        env.ledger().with_mut(|l| l.timestamp = initial_closing_at + 2_000 + challenge_period + 1);
+        client.finalize_close(&id);
+        assert_eq!(client.get_channel_info(&id).status, ChannelStatus::Closed);
     }
 }
