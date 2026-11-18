@@ -1,7 +1,7 @@
 #![no_std]
 
 use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
-use soroban_sdk::{contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env, Vec};
+use soroban_sdk::{contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token, vec, Address, Env, Vec};
 
 const TTL_THRESHOLD: u32 = 100;
 const TTL_EXTEND_TO: u32 = 5_000_000;
@@ -17,6 +17,51 @@ const MAX_PENDING_LIFETIME: u64 = 17_280; // ~1 day at 5s/ledger
 #[contractclient(name = "ComplianceClient")]
 pub trait ComplianceInterface {
     fn is_allowed(env: Env, address: Address) -> bool;
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InitEvent {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComplianceSetEvent {
+    pub compliance: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementProposedEvent {
+    #[topic]
+    pub merchant: Address,
+    pub settlement_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementApprovedEvent {
+    #[topic]
+    pub signer: Address,
+    pub settlement_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementExecutedEvent {
+    #[topic]
+    pub merchant: Address,
+    pub settlement_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementExpiredEvent {
+    pub settlement_id: u64,
 }
 
 #[contracttype]
@@ -121,7 +166,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::NextId, &1u64);
-        env.events().publish((symbol_short!("init"),), admin);
+        InitEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -130,11 +175,10 @@ impl TreasuryContract {
     /// addresses before funds move. Fails with `NotInitialized` before
     /// `initialize`.
     pub fn set_compliance(env: Env, compliance: Address) -> Result<(), TreasuryError> {
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Compliance, &compliance);
-        // "compliance" is 10 chars, over Soroban's 9-char symbol_short cap;
-        // "complset" ("compliance set") keeps the intent within the limit.
-        env.events().publish((symbol_short!("complset"),), compliance);
+        ComplianceSetEvent { compliance }.publish(&env);
         Ok(())
     }
 
@@ -257,7 +301,7 @@ impl TreasuryContract {
             proposed_at: env.ledger().timestamp(),
         };
         Self::save_settlement(&env, id, &settlement);
-        env.events().publish((symbol_short!("proposed"), merchant), (id, amount));
+        SettlementProposedEvent { merchant, settlement_id: id, amount }.publish(&env);
         Ok(id)
     }
 
@@ -287,7 +331,7 @@ impl TreasuryContract {
         settlement.approved_at.push_back(env.ledger().timestamp());
         env.storage().persistent().set(&DataKey::Settlement(settlement_id), &settlement);
         env.storage().persistent().extend_ttl(&DataKey::Settlement(settlement_id), TTL_THRESHOLD, TTL_EXTEND_TO);
-        env.events().publish((symbol_short!("approved"), signer), settlement_id);
+        SettlementApprovedEvent { signer, settlement_id }.publish(&env);
         Ok(())
     }
 
@@ -386,7 +430,7 @@ impl TreasuryContract {
         // Carries the merchant and amount, not just the id (issue #76): a
         // listener otherwise has to look the settlement back up to know what
         // was actually paid out.
-        env.events().publish((symbol_short!("executed"), merchant), (settlement_id, amount));
+        SettlementExecutedEvent { merchant, settlement_id, amount }.publish(&env);
         Ok(())
     }
 
@@ -422,7 +466,7 @@ impl TreasuryContract {
 
         settlement.status = SettlementStatus::Cancelled;
         Self::save_settlement(&env, settlement_id, &settlement);
-        env.events().publish((symbol_short!("expired"),), settlement_id);
+        SettlementExpiredEvent { settlement_id }.publish(&env);
         Ok(())
     }
 
@@ -545,7 +589,7 @@ mod test {
     #[test]
     fn approve_settlement_event_records_approving_signer() {
         use soroban_sdk::testutils::Events as _;
-        use soroban_sdk::{IntoVal, Val};
+        use soroban_sdk::Event as _;
         let env = Env::default();
         env.mock_all_auths();
         let (client, _admin, signers, _token) = setup(&env);
@@ -555,9 +599,129 @@ mod test {
         let approver = signers.get(1).unwrap();
         client.approve_settlement(&approver, &id);
 
-        let topics: soroban_sdk::Vec<Val> = (symbol_short!("approved"), approver.clone()).into_val(&env);
-        let data: Val = id.into_val(&env);
-        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+        let expected = SettlementApprovedEvent { signer: approver.clone(), settlement_id: id };
+        assert_eq!(env.events().all(), [expected.to_xdr(&env, &client.address)]);
+    }
+
+    // issue #255: available_balance, committed_balance, is_settlement_payable
+    // and sweep_expired_settlement had zero test coverage. This exercises
+    // the accounting across propose -> execute, including a second
+    // concurrently-pending settlement so "committed" genuinely reflects the
+    // sum across settlements rather than just the one under test.
+    #[test]
+    fn available_and_committed_balance_track_pending_settlements() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, token_id) = setup(&env);
+        let merchant_a = Address::generate(&env);
+        let merchant_b = Address::generate(&env);
+        let token_balance = token::TokenClient::new(&env, &token_id).balance(&client.address);
+
+        // Nothing pending yet: the whole balance is available.
+        assert_eq!(client.committed_balance(), 0);
+        assert_eq!(client.available_balance(), token_balance);
+
+        let id_a = client.propose_settlement(&signers.get(0).unwrap(), &merchant_a, &1_000_0000i128);
+        assert_eq!(client.committed_balance(), 1_000_0000i128);
+        assert_eq!(client.available_balance(), token_balance - 1_000_0000i128);
+
+        let id_b = client.propose_settlement(&signers.get(0).unwrap(), &merchant_b, &2_000_0000i128);
+        assert_eq!(client.committed_balance(), 3_000_0000i128);
+        assert_eq!(client.available_balance(), token_balance - 3_000_0000i128);
+
+        // Executing settlement A moves real funds out (shrinking the actual
+        // token balance) and removes A from the pending/committed total —
+        // both effects must net out so available_balance tracks the same
+        // number either way.
+        client.approve_settlement(&signers.get(1).unwrap(), &id_a);
+        client.execute_settlement(&signers.get(0).unwrap(), &id_a);
+        assert_eq!(client.committed_balance(), 2_000_0000i128);
+        let new_token_balance = token::TokenClient::new(&env, &token_id).balance(&client.address);
+        assert_eq!(new_token_balance, token_balance - 1_000_0000i128);
+        assert_eq!(client.available_balance(), new_token_balance - 2_000_0000i128);
+
+        let _ = id_b; // id_b stays Pending throughout; only its committed total is asserted.
+    }
+
+    #[test]
+    fn is_settlement_payable_reflects_funding_and_settlement_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, _token) = setup(&env);
+        let merchant = Address::generate(&env);
+
+        // Unknown id: false, not a trap.
+        assert!(!client.is_settlement_payable(&999u64));
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        // The treasury (funded with 100_000_0000 in setup()) can cover this
+        // comfortably on its own.
+        assert!(client.is_settlement_payable(&id));
+
+        // Once Executed, it is no longer "payable" in this sense — it has
+        // already been paid.
+        client.approve_settlement(&signers.get(1).unwrap(), &id);
+        client.execute_settlement(&signers.get(0).unwrap(), &id);
+        assert!(!client.is_settlement_payable(&id));
+
+        // A settlement that over-commits the treasury relative to the other
+        // still-Pending settlement's first claim is reported unpayable.
+        let big_id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &90_000_0000i128);
+        let other_id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &20_000_0000i128);
+        assert!(!client.is_settlement_payable(&big_id));
+        assert!(!client.is_settlement_payable(&other_id));
+    }
+
+    #[test]
+    fn sweep_expired_settlement_cancels_only_after_lifetime_elapses_and_frees_committed_balance() {
+        use soroban_sdk::testutils::Ledger;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, token_id) = setup(&env);
+        let merchant = Address::generate(&env);
+        let token_balance = token::TokenClient::new(&env, &token_id).balance(&client.address);
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+
+        // Not expired yet: rejected one unit before the boundary.
+        env.ledger().with_mut(|l| l.timestamp += MAX_PENDING_LIFETIME - 1);
+        let res = client.try_sweep_expired_settlement(&id);
+        assert_eq!(res, Err(Ok(TreasuryError::NotExpired)));
+        assert_eq!(client.get_settlement(&id).status, SettlementStatus::Pending);
+        assert_eq!(client.committed_balance(), 1_000_0000i128);
+
+        // Exactly at the boundary, the sweep succeeds.
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        client.sweep_expired_settlement(&id);
+        assert_eq!(client.get_settlement(&id).status, SettlementStatus::Cancelled);
+
+        // Cancelling frees the committed claim: no real funds ever moved
+        // (sweep never calls the token contract), so the whole balance is
+        // available again.
+        assert_eq!(client.committed_balance(), 0);
+        assert_eq!(client.available_balance(), token_balance);
+        assert_eq!(token::TokenClient::new(&env, &token_id).balance(&client.address), token_balance);
+    }
+
+    #[test]
+    fn sweep_expired_settlement_rejects_unknown_and_non_pending() {
+        use soroban_sdk::testutils::Ledger;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, signers, _token) = setup(&env);
+        let merchant = Address::generate(&env);
+
+        let res = client.try_sweep_expired_settlement(&999u64);
+        assert_eq!(res, Err(Ok(TreasuryError::NotFound)));
+
+        let id = client.propose_settlement(&signers.get(0).unwrap(), &merchant, &1_000_0000i128);
+        client.approve_settlement(&signers.get(1).unwrap(), &id);
+        client.execute_settlement(&signers.get(0).unwrap(), &id);
+
+        env.ledger().with_mut(|l| l.timestamp += MAX_PENDING_LIFETIME + 1);
+        let res = client.try_sweep_expired_settlement(&id);
+        assert_eq!(res, Err(Ok(TreasuryError::NotPending)));
+        assert_eq!(client.get_settlement(&id).status, SettlementStatus::Executed);
     }
 }
 

@@ -24,6 +24,24 @@ jobs:
       - name: Run tests
         run: cargo test --all --features testutils
 
+  # Issue #29 (closed) asked for a clippy job specifically so a deprecated
+  # soroban-sdk API (like the raw `Events::publish` call `#[contractevent]`
+  # replaced, issue #246) gets caught in CI instead of drifting back in
+  # unreviewed. No such job existed. Denying only the `deprecated` lint, not
+  # `-D warnings`, keeps this job scoped to that one regression rather than
+  # also gating merges on unrelated, pre-existing style lints (e.g.
+  # clippy::inconsistent_digit_grouping) this issue never asked it to fix.
+  clippy:
+    name: Clippy (deprecation check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy, denying deprecated-API usage
+        run: cargo clippy --all --all-targets --features testutils -- -D deprecated
+
   build-wasm:
     runs-on: ubuntu-latest
     steps:

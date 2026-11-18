@@ -1,7 +1,7 @@
 #![no_std]
 
 use konfirm_common::{require_admin, require_not_paused, set_paused, CommonError};
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env};
 
 const TTL_THRESHOLD: u32 = 100;
 const TTL_EXTEND_TO: u32 = 5_000_000;
@@ -55,8 +55,17 @@ pub struct ClearedEvent {
 #[derive(Clone)]
 pub struct AdminChangedEvent {
     #[topic]
+    pub current_admin: Address,
     pub new_admin: Address,
 }
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PausedEvent;
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnpausedEvent;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -203,7 +212,7 @@ impl ComplianceContract {
         current_admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish((symbol_short!("admin"), current_admin), new_admin);
+        AdminChangedEvent { current_admin, new_admin }.publish(&env);
         Ok(())
     }
 
@@ -214,7 +223,7 @@ impl ComplianceContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((symbol_short!("paused"),), ());
+        PausedEvent.publish(&env);
         Ok(())
     }
 
@@ -223,7 +232,7 @@ impl ComplianceContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((symbol_short!("unpaused"),), ());
+        UnpausedEvent.publish(&env);
         Ok(())
     }
 
@@ -338,7 +347,7 @@ mod test {
     #[test]
     fn set_admin_event_records_outgoing_and_incoming_admin() {
         use soroban_sdk::testutils::Events as _;
-        use soroban_sdk::{vec, Val};
+        use soroban_sdk::Event as _;
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -346,8 +355,7 @@ mod test {
 
         client.set_admin(&admin, &new_admin);
 
-        let topics: soroban_sdk::Vec<Val> = (symbol_short!("admin"), admin.clone()).into_val(&env);
-        let data: Val = new_admin.clone().into_val(&env);
-        assert_eq!(env.events().all(), vec![&env, (client.address.clone(), topics, data)]);
+        let expected = AdminChangedEvent { current_admin: admin.clone(), new_admin: new_admin.clone() };
+        assert_eq!(env.events().all(), [expected.to_xdr(&env, &client.address)]);
     }
 }

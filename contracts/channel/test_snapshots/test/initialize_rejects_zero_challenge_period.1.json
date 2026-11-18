@@ -158,11 +158,14 @@
           "v0": {
             "topics": [
               {
-                "symbol": "init"
+                "symbol": "init_event"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
               }
             ],
             "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+              "map": []
             }
           }
         }

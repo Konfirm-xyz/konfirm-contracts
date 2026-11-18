@@ -25,7 +25,8 @@ For each contract being redeployed:
    - `treasury`: set the signer set and threshold. The threshold is fixed at initialization; changing it later means another redeploy.
    - `channel`: set `challenge_period_secs` (the Testnet instance uses 86400). It is a deployment parameter, not hard-coded.
    - `compliance` / `payment`: set the admin.
-4. Re-apply the compliance block list (see section 1) if you redeployed `compliance`.
+4. Call `set_compliance` on the redeployed `payment` and on the redeployed `treasury`, pointing each at the address of the (current, correct) `compliance` contract. Do this even if you did not redeploy `compliance` itself — a freshly-initialized `payment` or `treasury` instance starts with no compliance contract configured, which makes `record_payment` / `propose_settlement` / `execute_settlement` skip screening entirely (advisory/no-op mode) rather than fail closed. Do this before recording or settling any real payment against the new instance.
+5. Re-apply the compliance block list (see section 1) if you redeployed `compliance`.
 
 ## 3. Files and repos that embed a contract address
 
